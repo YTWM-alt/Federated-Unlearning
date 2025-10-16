@@ -14,6 +14,7 @@ pip-wheel-metadata/
 # --- IDE 配置 ---
 .vscode/
 .idea/
+*.code-workspace
 
 # --- 日志与输出 ---
 logs/
@@ -23,16 +24,24 @@ runs/
 wandb/
 tensorboard/
 *.log
+*.out
+*.err
 
 # --- 数据与模型 ---
 data/
 datasets/
+weights_demo/
 *.h5
 *.pt
 *.pth
 *.ckpt
 *.npz
 *.npy
+*.pkl
+*.onnx           # ✅ 一些模型导出格式
+*.tflite
+*.pb
+*.bin
 
 # --- 临时文件 ---
 .DS_Store
@@ -41,12 +50,41 @@ Thumbs.db
 *.bak
 *.swp
 *.swo
+*.save           # ✅ 临时保存文件（部分 IDE/编辑器生成）
+*.autosave
+*.old
 
 # --- 编译产物 ---
 build/
 dist/
 *.egg-info/
+__pypackages__/  # ✅ Python 3.11+ 内置临时包缓存
 
-# --- 其它不必要上传的文件 ---
-weights_demo/
+# --- 实验相关临时文件 ---
+experiments/cache/
+experiments/tmp/
+outputs/
+profile_logs/    # ✅ 性能分析、训练日志目录（torch.profiler等）
+
+# --- Jupyter / Colab ---
+.ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/
+*.ipynb~
+*.nbconvert.ipynb
+
+# --- OS / 系统文件 ---
+*.tar
+*.zip
+*.gz
+*.7z
+*.rar
+
+# --- 私有/敏感配置 ---
+*.json
+*.yaml
+*.yml
+!configs/example*.yml     # ✅ 保留示例配置文件
+secrets/
+credentials/
+auth_token.txt
+token_*.txt
