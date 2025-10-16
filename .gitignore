@@ -1,0 +1,52 @@
+# --- Python 缓存 ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- 虚拟环境 ---
+venv/
+.env/
+.venv/
+env/
+ENV/
+pip-wheel-metadata/
+
+# --- IDE 配置 ---
+.vscode/
+.idea/
+
+# --- 日志与输出 ---
+logs/
+results/
+checkpoints/
+runs/
+wandb/
+tensorboard/
+*.log
+
+# --- 数据与模型 ---
+data/
+datasets/
+*.h5
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+
+# --- 临时文件 ---
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# --- 编译产物 ---
+build/
+dist/
+*.egg-info/
+
+# --- 其它不必要上传的文件 ---
+weights_demo/
+notebooks/.ipynb_checkpoints/

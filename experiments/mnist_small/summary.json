@@ -1,0 +1,142 @@
+{
+    "performance": {
+        "after_training": {
+            "test_acc": 0.8083,
+            "classwise_acc": {
+                "0": 0.9775510204081632,
+                "1": 0.9911894273127754,
+                "2": 0.9680232558139535,
+                "3": 0.693069306930693,
+                "4": 0.905295315682281,
+                "5": 0.7443946188340808,
+                "6": 0.9728601252609603,
+                "7": 0.9844357976653697,
+                "8": 0.002053388090349076,
+                "9": 0.7948463825569871
+            },
+            "clientwise_acc": {
+                "0": 93.00682261208577,
+                "1": 27.823004201680675,
+                "2": 76.26303127506014,
+                "3": 96.37610186092067,
+                "4": 97.456092703241,
+                "5": 63.43425788693627,
+                "6": 76.85084376701144,
+                "7": 98.38915470494418,
+                "8": 75.06493506493507,
+                "9": 96.94793536804309
+            }
+        },
+        "after_retraining": {
+            "test_acc": 0.8026,
+            "classwise_acc": {
+                "0": 0.9959183673469387,
+                "1": 0.9982378854625551,
+                "2": 0.9728682170542635,
+                "3": 0.9138613861386139,
+                "4": 0.3136456211812627,
+                "5": 0.4854260089686099,
+                "6": 0.9665970772442589,
+                "7": 0.9649805447470817,
+                "8": 0.3870636550308008,
+                "9": 0.9454905847373637
+            },
+            "clientwise_acc": {
+                "0": 60.00243664717348,
+                "1": 56.210609243697476,
+                "2": 93.48837209302326,
+                "3": 90.205680705191,
+                "4": 91.55350353068984,
+                "5": 86.36459877196697,
+                "6": 61.17310832879696,
+                "7": 99.61722488038276,
+                "8": 86.49350649350649,
+                "9": 98.17202546107393
+            }
+        },
+        "after_fair_vue": {
+            "test_acc": 0.7277,
+            "classwise_acc": {
+                "0": 0.9724489795918367,
+                "1": 0.9903083700440528,
+                "2": 0.9602713178294574,
+                "3": 0.5128712871287129,
+                "4": 0.0,
+                "5": 0.9663677130044843,
+                "6": 0.9686847599164927,
+                "7": 0.9153696498054474,
+                "8": 0.0,
+                "9": 0.9514370664023786
+            },
+            "clientwise_acc": {
+                "0": 41.80068226120858,
+                "1": 26.418067226890756,
+                "2": 83.3841218925421,
+                "3": 84.42703232125368,
+                "4": 87.71500995835596,
+                "5": 47.745077281388944,
+                "6": 96.1622210125204,
+                "7": 97.89473684210527,
+                "8": 72.98701298701299,
+                "9": 96.08291170230129
+            }
+        }
+    },
+    "mia_attack": {},
+    "config": {
+        "exp_name": "mnist_small",
+        "exp_path": "./experiments/",
+        "model": "smallcnn",
+        "pretrained": false,
+        "dataset": "mnist",
+        "optimizer": "adam",
+        "lr": 0.005,
+        "momentum": 0.9,
+        "weight_decay": 0.0001,
+        "batch_size": 128,
+        "num_local_epochs": 1,
+        "num_training_iterations": 40,
+        "num_participating_clients": -1,
+        "baselines": [
+            "fair_vue"
+        ],
+        "fair_rank_k": 8,
+        "fair_tau_mode": "median",
+        "fair_fisher_batches": 5,
+        "fair_vue_debug": true,
+        "fair_erase_scale": 0.1,
+        "skip_retraining": false,
+        "apply_backdoor": false,
+        "backdoor_position": "corner",
+        "num_backdoor_samples_per_forget_client": 10,
+        "backdoor_label": 0,
+        "apply_membership_inference": false,
+        "attack_type": "blackbox",
+        "apply_label_poisoning": false,
+        "num_label_poison_samples": 10,
+        "forget_clients": [
+            0
+        ],
+        "total_num_clients": 10,
+        "client_data_distribution": "dirichlet",
+        "dampening_constant": 0.5,
+        "dampening_upper_bound": 0.5,
+        "ratio_cutoff": 0.5,
+        "device": "cuda",
+        "seed": 42,
+        "verbose": true,
+        "num_workers": 0,
+        "fim_max_batches": 2,
+        "fim_max_passes": 1,
+        "fim_mode": "prob",
+        "fim_topk": null,
+        "fim_ratio_cutoff": 1.0,
+        "fim_gamma": 0.2,
+        "fim_upper_bound": 1.0,
+        "finetune_epochs": 0,
+        "finetune_lr": 0.001,
+        "finetune_wd": 0.0,
+        "global_weight": "",
+        "output_weight_path": ""
+    }
+}

@@ -1,0 +1,69 @@
+[Unlearn-Only] 复用训练结果：/home/cloudwaves/CloudwavesWork/scientific_research/ConDa-Federated-Unlearning/experiments/cifar10_allcnn/full_training/final_model.pth
+Performance after training : {'test_acc': 0.8023, 'classwise_acc': {0: 0.907, 1: 0.95, 2: 0.68, 3: 0.628, 4: 0.787, 5: 0.759, 6: 0.933, 7: 0.768, 8: 0.845, 9: 0.766}, 'clientwise_acc': {0: 81.71715361175838, 1: 86.73671689135607, 2: 91.00239479986315, 3: 90.61592097617664, 4: 89.12974683544303, 5: 76.28065064336003, 6: 86.27477416745315, 7: 93.7242549067119, 8: 92.61983261476033, 9: 86.55094552639007}}
+[Training模型] 忘却客户端5自有数据精度: 76.28%
+Retain Client wise Loaders: {0: <torch.utils.data.dataloader.DataLoader object at 0x72cad7154da0>, 1: <torch.utils.data.dataloader.DataLoader object at 0x72cad7bd7260>, 2: <torch.utils.data.dataloader.DataLoader object at 0x72cad85c02c0>, 3: <torch.utils.data.dataloader.DataLoader object at 0x72cad8614680>, 4: <torch.utils.data.dataloader.DataLoader object at 0x72cae15cc350>, 6: <torch.utils.data.dataloader.DataLoader object at 0x72cacdd12d20>, 7: <torch.utils.data.dataloader.DataLoader object at 0x72cacdd12db0>, 8: <torch.utils.data.dataloader.DataLoader object at 0x72cacdd12e40>, 9: <torch.utils.data.dataloader.DataLoader object at 0x72cacdd12ed0>}
+[Skip] 跳过重训练基线（--skip_retraining）
+>>> Running FAIR-VUE (round-wise)...
+[FV-DBG] rounds_with_deltas=31 -> [1, 2, 3, 4, 5, 6, 7, 8]...
+[FV-DBG] total (round,client) delta pairs=310
+[FV-DBG] round=1 mean||Δ||=7.677e+01 (n=10)
+[FV-DBG] round=2 mean||Δ||=7.658e+01 (n=10)
+[FV-DBG] round=3 mean||Δ||=7.652e+01 (n=10)
+[FV-DBG] target_id=5, T=len(target_deltas_list)=31, M=len(other_deltas_list)=279
+[FV-DBG] fisher: device=cuda:0, D=1625770, min= 2.884e-08, max= 7.081e-02, mean= 1.684e-04
+[FV-DBG] Xw.shape=(31, 1625770), device=cuda:0
+[FV-DBG] top singular values=[0.063993439078331, 0.04385051876306534, 0.03515441343188286, 0.0327267050743103, 0.029554743319749832, 0.028951847925782204, 0.02775231935083866, 0.02714047208428383], k=8, V.device=cuda:0
+[FV-DBG] rho stats: n=8, min=1.789e-02, q25=2.427e-02, median=2.581e-02, q75=4.503e-02, max=7.739e-02, tau=2.680e-02
+[FV-DBG] |V_spec|=4, idx=[1, 2, 6, 7]
+[FV-DBG] |V_comm|=4
+[FV-DBG] Q is None? False, Q.shape=(1625770, 4), device=cuda:0
+[FV-DBG] used_rounds_for_target=31, ||spec_total||_2=5.168e+00
+Performance after FAIR-VUE : {'test_acc': 0.7935, 'classwise_acc': {0: 0.902, 1: 0.945, 2: 0.717, 3: 0.592, 4: 0.732, 5: 0.787, 6: 0.932, 7: 0.755, 8: 0.814, 9: 0.759}, 'clientwise_acc': {0: 80.1935830794049, 1: 84.08009516256939, 2: 89.4628806021211, 3: 89.91865194654271, 4: 89.36708860759494, 5: 74.31415392085458, 6: 86.3826344883376, 7: 92.87618124545675, 8: 92.26477301547045, 9: 84.9421394298617}}
+[FAIR-VUE模型] 忘却客户端5自有数据精度: 74.31%
+[HEAL] start healing | steps=100 | lr=0.0001 | T=2.0 | λ_kd=0.5 | λ_ortho=0.001
+[HEAL] device=cuda, dataloader size=359
+[HEAL] v_spec loaded, shape=torch.Size([1625770, 4]), rank=4
+[HEAL step 000] loss_task=0.2648 | loss_kd=0.0681 | loss_ortho=0.0565 | total=0.2989
+[HEAL step 020] loss_task=0.3653 | loss_kd=0.0846 | loss_ortho=0.0539 | total=0.4077
+[HEAL step 040] loss_task=0.2221 | loss_kd=0.1162 | loss_ortho=0.0534 | total=0.2802
+[HEAL step 060] loss_task=0.2754 | loss_kd=0.1177 | loss_ortho=0.0502 | total=0.3343
+[HEAL step 080] loss_task=0.3388 | loss_kd=0.1030 | loss_ortho=0.0490 | total=0.3903
+[HEAL step 099] loss_task=0.3015 | loss_kd=0.0852 | loss_ortho=0.0468 | total=0.3441
+[HEAL] done in 6.0s
+
+[HEAL] Performance after healing : {'test_acc': 0.8166, 'classwise_acc': {0: 0.875, 1: 0.928, 2: 0.663, 3: 0.53, 4: 0.858, 5: 0.842, 6: 0.897, 7: 0.842, 8: 0.866, 9: 0.865}, 'clientwise_acc': {0: 91.43215630041226, 1: 92.24821570182395, 2: 93.15771467670201, 3: 93.02730970366066, 4: 90.94936708860759, 5: 70.91527069677106, 6: 93.62275852770662, 7: 95.08117276472014, 8: 95.94217600811564, 9: 87.34123624047417}}
+[HEAL] 忘却客户端5自有数据精度(治疗后): 70.92%
+
+
+
+
+Performance after training : {'test_acc': 0.8023, 'classwise_acc': {0: 0.907, 1: 0.95, 2: 0.68, 3: 0.628, 4: 0.787, 5: 0.759, 6: 0.933, 7: 0.768, 8: 0.845, 9: 0.766}, 'clientwise_acc': {0: 81.71715361175838, 1: 86.73671689135607, 2: 91.00239479986315, 3: 90.61592097617664, 4: 89.12974683544303, 5: 76.28065064336003, 6: 86.27477416745315, 7: 93.7242549067119, 8: 92.61983261476033, 9: 86.55094552639007}}
+[Training模型] 忘却客户端5自有数据精度: 76.28%
+Retain Client wise Loaders: {0: <torch.utils.data.dataloader.DataLoader object at 0x70b172917ec0>, 1: <torch.utils.data.dataloader.DataLoader object at 0x70b172f457f0>, 2: <torch.utils.data.dataloader.DataLoader object at 0x70b172f45eb0>, 3: <torch.utils.data.dataloader.DataLoader object at 0x70b17256ec60>, 4: <torch.utils.data.dataloader.DataLoader object at 0x70b17c04d730>, 6: <torch.utils.data.dataloader.DataLoader object at 0x70b172ffcb30>, 7: <torch.utils.data.dataloader.DataLoader object at 0x70b168f115e0>, 8: <torch.utils.data.dataloader.DataLoader object at 0x70b168f11670>, 9: <torch.utils.data.dataloader.DataLoader object at 0x70b168f11700>}
+[Skip] 跳过重训练基线（--skip_retraining）
+>>> Running FAIR-VUE (round-wise)...
+[FV-DBG] rounds_with_deltas=31 -> [1, 2, 3, 4, 5, 6, 7, 8]...
+[FV-DBG] total (round,client) delta pairs=310
+[FV-DBG] round=1 mean||Δ||=7.677e+01 (n=10)
+[FV-DBG] round=2 mean||Δ||=7.658e+01 (n=10)
+[FV-DBG] round=3 mean||Δ||=7.652e+01 (n=10)
+[FV-DBG] target_id=5, T=len(target_deltas_list)=31, M=len(other_deltas_list)=279
+[FV-DBG] fisher: device=cuda:0, D=1625770, min= 1.470e-07, max= 7.047e-02, mean= 1.681e-04
+[FV-DBG] Xw.shape=(31, 1625770), device=cuda:0
+[FV-DBG] top singular values=[0.06388594210147858, 0.04379073902964592, 0.0350961834192276, 0.03266151249408722, 0.02946595288813114, 0.02894187532365322, 0.027649812400341034, 0.027095740661025047], k=12, V.device=cuda:0
+[FV-DBG] rho stats: n=12, min=1.539e-02, q25=1.988e-02, median=2.461e-02, q75=2.999e-02, max=7.859e-02, tau=2.484e-02
+[FV-DBG] |V_spec|=6, idx=[2, 6, 7, 9, 10, 11]
+[FV-DBG] |V_comm|=6
+[FV-DBG] Q is None? False, Q.shape=(1625770, 6), device=cuda:0
+[FV-DBG] used_rounds_for_target=31, ||spec_total||_2=4.547e+00
+Performance after FAIR-VUE : {'test_acc': 0.7552, 'classwise_acc': {0: 0.933, 1: 0.938, 2: 0.693, 3: 0.291, 4: 0.659, 5: 0.793, 6: 0.962, 7: 0.778, 8: 0.767, 9: 0.738}, 'clientwise_acc': {0: 77.12851765549381, 1: 79.77795400475813, 2: 86.99965788573384, 3: 88.4950610110401, 4: 87.94303797468355, 5: 53.8965768390386, 6: 87.4747202372927, 7: 90.8408044584444, 8: 90.97134161805732, 9: 72.5373976855772}}
+[FAIR-VUE模型] 忘却客户端5自有数据精度: 53.90%
+[HEAL] start healing | steps=5 | lr=0.0001 | T=2.0 | λ_kd=0.25 | λ_ortho=0.001 | grad_proj=True
+[HEAL] device=cuda, dataloader size=359
+[HEAL] v_spec loaded, shape=(1625770, 6), rank=6
+[HEAL step 000] loss_task=0.3236 | loss_kd=0.2025 | loss_ortho=0.3400 | total=0.3746
+[HEAL step 004] loss_task=0.3152 | loss_kd=0.1577 | loss_ortho=0.3413 | total=0.3546
+[HEAL] done in 0.4s
+
+[HEAL] Performance after healing : {'test_acc': 0.7882, 'classwise_acc': {0: 0.911, 1: 0.834, 2: 0.665, 3: 0.495, 4: 0.81, 5: 0.757, 6: 0.947, 7: 0.831, 8: 0.803, 9: 0.829}, 'clientwise_acc': {0: 85.71428571428571, 1: 88.48136399682791, 2: 88.26548067054397, 3: 90.9064497385241, 4: 87.13607594936708, 5: 65.96261228453508, 6: 88.93083456923284, 7: 87.23043372910104, 8: 92.74663961450672, 9: 80.25684448207734}}
+[HEAL] 忘却客户端5自有数据精度(治疗后): 65.96%
