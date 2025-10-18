@@ -7,6 +7,10 @@ import os
 from copy import deepcopy
 import random
 import numpy as np
+import sys
+from datetime import datetime
+import re
+import io
 
 
 from FedUnlearner.utils import print_exp_details, print_clientwise_class_distribution
@@ -29,6 +33,87 @@ from FedUnlearner.baselines.fair_vue.subspace import (
     rho_values, split_subspaces, flatten_state_dict, state_dict_like
 )
 from FedUnlearner.baselines.fair_vue.projection import projection_matrix
+
+# === 日志目录与文件 ===
+os.makedirs("./logs", exist_ok=True)
+log_path = f"./logs/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+class ProxyLog:
+    """
+    代理 stdout/stderr：
+    1) 过滤 tqdm 进度条与 'Client: x' 行到日志文件
+    2) 控制台照常显示（保留 '█'）
+    3) 对外暴露 isatty/encoding/fileno 等，让 tqdm 识别为 TTY 支持 Unicode
+    """
+    def __init__(self, stream):
+        self.stream = stream
+        # 匹配进度条（百分比+两侧竖线）或常见吞吐字段；兼容 Unicode/ASCII 进度条
+        self.re_bar = re.compile(
+            r"(?:\r)?(?:(?=.*\d{1,3}%\|.+\|).*|.*\|[#█░▉▊▋▌▍▎▏]+\|.*|.*\b(?:it/s|s/it|ETA|elapsed|remaining)\b.*)"
+        )
+        # 匹配 "Client: 数字" 整行
+        self.re_client = re.compile(r"^\s*Client:\s*\d+\s*$")
+        self._buf = ""
+        # 透传编码属性，避免 tqdm 误判
+        self.encoding = getattr(stream, "encoding", "utf-8")
+        self.errors = getattr(stream, "errors", "replace")
+
+    def _should_skip(self, text: str) -> bool:
+        # tqdm 更新常带 '\r' 且不一定含换行；遇到 '\r' 直接视为进度刷新，不落日志
+        if "\r" in text:
+            return True
+        if self.re_bar.search(text):
+            return True
+        if self.re_client.search(text.strip()):
+            return True
+        return False
+
+    def write(self, message: str):
+        # 累积到换行，确保按“行”判断是否写日志，避免 tqdm 的碎片更新误判
+        self._buf += message
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line_out = line + "\n"
+            if not self._should_skip(line_out):
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(line_out)
+            # 控制台始终原样输出
+            self.stream.write(line_out)
+
+    def flush(self):
+        # 刷出残留（通常是非进度的最后一行）
+        if self._buf:
+            if not self._should_skip(self._buf):
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(self._buf)
+            self.stream.write(self._buf)
+            self._buf = ""
+        if hasattr(self.stream, "flush"):
+            self.stream.flush()
+
+    # —— 关键透传，让 tqdm 识别为“真 TTY”，从而使用 Unicode '█' —— #
+    def isatty(self):
+        try:
+            return self.stream.isatty()
+        except Exception:
+            return True  # 宁可当作 TTY
+
+    def fileno(self):
+        try:
+            return self.stream.fileno()
+        except Exception:
+            raise io.UnsupportedOperation("fileno")
+
+    def writable(self):
+        return True
+
+    def __getattr__(self, name):
+        # 其他一切属性/方法都代理给原始流
+        return getattr(self.stream, name)
+
+# 应用到 stdout / stderr
+sys.stdout = ProxyLog(sys.stdout)
+sys.stderr = ProxyLog(sys.stderr)
 
 def get_accuracy_only(model, dataloader, device):
     model.eval()
