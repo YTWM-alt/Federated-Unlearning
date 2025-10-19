@@ -38,28 +38,32 @@ from FedUnlearner.baselines.fair_vue.projection import projection_matrix
 os.makedirs("./logs", exist_ok=True)
 log_path = f"./logs/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
+ # === 日志：支持多文件；真正初始化延后到解析参数之后 ===
 class ProxyLog:
     """
     代理 stdout/stderr：
-    1) 过滤 tqdm 进度条与 'Client: x' 行到日志文件
-    2) 控制台照常显示（保留 '█'）
-    3) 对外暴露 isatty/encoding/fileno 等，让 tqdm 识别为 TTY 支持 Unicode
+    1) 可写入多个日志文件（同一份日志复制到多处）
+    2) 控制台照常显示（保留 tqdm 进度条等）
+    3) 暴露 isatty/fileno 等，让 tqdm 识别为 TTY
     """
-    def __init__(self, stream):
+    def __init__(self, stream, log_paths):
+        import os
         self.stream = stream
-        # 匹配进度条（百分比+两侧竖线）或常见吞吐字段；兼容 Unicode/ASCII 进度条
+        # 允许传入字符串或列表
+        if isinstance(log_paths, (str, os.PathLike)):
+            self.log_paths = [str(log_paths)]
+        else:
+            self.log_paths = [str(p) for p in log_paths]
+        # 进度条/吞吐的过滤（保持与原逻辑一致）
         self.re_bar = re.compile(
             r"(?:\r)?(?:(?=.*\d{1,3}%\|.+\|).*|.*\|[#█░▉▊▋▌▍▎▏]+\|.*|.*\b(?:it/s|s/it|ETA|elapsed|remaining)\b.*)"
         )
-        # 匹配 "Client: 数字" 整行
         self.re_client = re.compile(r"^\s*Client:\s*\d+\s*$")
         self._buf = ""
-        # 透传编码属性，避免 tqdm 误判
         self.encoding = getattr(stream, "encoding", "utf-8")
         self.errors = getattr(stream, "errors", "replace")
 
     def _should_skip(self, text: str) -> bool:
-        # tqdm 更新常带 '\r' 且不一定含换行；遇到 '\r' 直接视为进度刷新，不落日志
         if "\r" in text:
             return True
         if self.re_bar.search(text):
@@ -68,52 +72,62 @@ class ProxyLog:
             return True
         return False
 
+    def _write_all(self, text: str):
+        for p in self.log_paths:
+            # 目录可能尚未创建；这里稳妥创建
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(text)
+
     def write(self, message: str):
-        # 累积到换行，确保按“行”判断是否写日志，避免 tqdm 的碎片更新误判
         self._buf += message
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
             line_out = line + "\n"
             if not self._should_skip(line_out):
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(line_out)
-            # 控制台始终原样输出
+                self._write_all(line_out)
             self.stream.write(line_out)
 
     def flush(self):
-        # 刷出残留（通常是非进度的最后一行）
         if self._buf:
             if not self._should_skip(self._buf):
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(self._buf)
+                self._write_all(self._buf)
             self.stream.write(self._buf)
             self._buf = ""
         if hasattr(self.stream, "flush"):
             self.stream.flush()
 
-    # —— 关键透传，让 tqdm 识别为“真 TTY”，从而使用 Unicode '█' —— #
     def isatty(self):
         try:
             return self.stream.isatty()
         except Exception:
-            return True  # 宁可当作 TTY
+            return True
 
     def fileno(self):
         try:
             return self.stream.fileno()
         except Exception:
-            raise io.UnsupportedOperation("fileno")
+            import io as _io
+            raise _io.UnsupportedOperation("fileno")
 
     def writable(self):
         return True
 
     def __getattr__(self, name):
-        # 其他一切属性/方法都代理给原始流
         return getattr(self.stream, name)
 
-# 应用到 stdout / stderr
-sys.stdout = ProxyLog(sys.stdout)
-sys.stderr = ProxyLog(sys.stderr)
+# 命令行显式布尔解析函数
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+# ——————————————
 
 def get_accuracy_only(model, dataloader, device):
     model.eval()
@@ -229,16 +243,16 @@ parser.add_argument('--baselines', type=str, nargs="*", default=[],
 parser.add_argument('--fair_rank_k', type=int, default=16, help='SVD 主成分数')
 parser.add_argument('--fair_tau_mode', type=str, default='median', choices=['median','mean'], help='ρ阈值模式')
 parser.add_argument('--fair_fisher_batches', type=int, default=5, help='Fisher估计的批次数')
-parser.add_argument('--fair_vue_debug', action='store_true',
-                    help='打印 FAIR-VUE 关键中间量，便于排查是否真的执行')
+parser.add_argument('--fair_vue_debug', type=str2bool, default=False,
+                    help='是否打印 FAIR-VUE 调试信息（True/False）')
 parser.add_argument('--fair_erase_scale', type=float, default=0.25,
                     help='特异分量擦除强度 (0,1]，默认0.25，建议先小后大')
-parser.add_argument('--skip_retraining', action='store_true',
-                    help='跳过重训练基线（不执行 retain-only retraining 及其评估）')
+parser.add_argument('--skip_retraining', type=str2bool, default=False,
+                    help='是否跳过重训练阶段（True/False）')
 
 # backdoor attack related arguments
-parser.add_argument('--apply_backdoor', action='store_true',
-                    help='apply backdoor attack')
+parser.add_argument('--apply_backdoor', type=str2bool, default=False,
+                    help='是否启用后门攻击（True/False）')
 parser.add_argument('--backdoor_position', type=str, default='corner', choices=["corner", "center"],
                     help='backdoor position')
 parser.add_argument('--num_backdoor_samples_per_forget_client', type=int, default=10,
@@ -247,14 +261,14 @@ parser.add_argument('--backdoor_label', type=int,
                     default=0, help='backdoor label')
 
 # membership inference attack related arguments
-parser.add_argument('--apply_membership_inference', type=bool, default=False,
-                    help='apply membership inference attack')
+parser.add_argument('--apply_membership_inference', type=str2bool, default=False,
+                    help='是否启用成员推理攻击（True/False）')
 parser.add_argument('--attack_type', type=str, default='blackbox', choices=["blackbox", "whitebox"],
                     help='attack type')
 
 # label posioning attack related arguments
-parser.add_argument('--apply_label_poisoning', type=bool, default=False,
-                    help='apply label poisoning attack')
+parser.add_argument('--apply_label_poisoning', type=str2bool, default=False,
+                    help='是否启用标签投毒（True/False）')
 parser.add_argument('--num_label_poison_samples', type=int, default=10,
                     help='number of label poisoning samples')
 
@@ -279,8 +293,8 @@ parser.add_argument("--num_workers", type=int, default=32,
                     help="number of workers for data loading")
 
 # create argument parser ...
-parser.add_argument('--unlearn_only', action='store_true',
-                    help='跳过联邦训练，直接在已有 full_training 上执行遗忘/治疗/评测')
+parser.add_argument('--skip_training', type=str2bool, default=False,
+                    help='是否仅执行遗忘流程（True/False）')
 parser.add_argument('--full_training_dir', type=str, default='',
                     help='已有的 full_training 目录（含 iteration_*/client_*.pth 和 final_model.pth）')
 parser.add_argument('--global_ckpt', type=str, default='',
@@ -302,8 +316,8 @@ parser.add_argument("--output_weight_path", type=str, default="")
 
 
 # ==== HEAL / 模型治疗参数 ====
-parser.add_argument('--heal', action='store_true',
-                    help='开启治疗阶段（FAIR-VUE 擦除后运行 healing）')
+parser.add_argument('--heal', type=str2bool, default=False,
+                    help='是否启用治疗阶段（True/False）')
 parser.add_argument('--heal_alpha', type=float, default=0.05,
                     help='权重插值系数 α，student←(1-α)student+α·teacher，建议 0.02~0.10')
 parser.add_argument('--heal_steps', type=int, default=80,
@@ -334,7 +348,34 @@ if __name__ == "__main__":
     # ---- 旧版 Legacy-Unlearn 总开关（默认关）----
     RUN_LEGACY_UNLEARN = False
     weights_path = os.path.abspath(os.path.join(args.exp_path, args.exp_name))
+    
+    # === 两份日志路径（时间命名 + 参数命名） ===
+    LOG_ROOT = "./logs"
+    TIME_DIR = os.path.join(LOG_ROOT, "by_time")
+    PARAM_DIR = os.path.join(LOG_ROOT, "by_params")
+    os.makedirs(TIME_DIR, exist_ok=True)
+    os.makedirs(PARAM_DIR, exist_ok=True)
 
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 只支持单个忘却客户端；若为空就用 NA 占位
+    cid = (args.forget_clients[0] if getattr(args, "forget_clients", None) else "NA")
+
+    param_basename = (
+        f"client{cid}"
+        f"_k{args.fair_rank_k}"
+        f"_tau{args.fair_tau_mode}"
+        f"_fb{args.fair_fisher_batches}"
+        f"_es{args.fair_erase_scale}.log"
+    )
+
+    log_path_time   = os.path.join(TIME_DIR,   f"run_{ts}.log")
+    log_path_param  = os.path.join(PARAM_DIR,  param_basename)
+
+    # 安装到 stdout / stderr（同样的输出写两份日志）
+    sys.stdout = ProxyLog(sys.stdout, [log_path_time, log_path_param])
+    sys.stderr = ProxyLog(sys.stderr, [log_path_time, log_path_param])
+
+    # 之后再打印实验详情，确保写入两份日志
     print_exp_details(args)
     summary = {}
     # get the dataset
@@ -451,7 +492,7 @@ if __name__ == "__main__":
     # global_model = fed_train(...)
 
     # 改为：
-    if args.unlearn_only:
+    if args.skip_training:
         # 复用已有训练产物
         train_path = os.path.abspath(
             args.full_training_dir if args.full_training_dir

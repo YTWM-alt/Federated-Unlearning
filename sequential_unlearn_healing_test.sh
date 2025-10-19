@@ -30,7 +30,7 @@ for CID in "${FORGET_LIST[@]}"; do
     --fair_fisher_batches 10 \
     --fair_erase_scale 0.2 \
     --fair_vue_debug \
-    --unlearn_only \
+    --skip_training \
     --skip_retraining \
     --full_training_dir ./experiments/cifar10_allcnn/full_training \
     --heal \

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================
-# FairVUE 参数搜索 + 自动日志命名
+# FairVUE 参数搜索（去除日志写入，仅控制台输出）
 # 保持 --exp_name 不变
 # ============================================
 
@@ -20,14 +20,10 @@ EXP_NAME="cifar10_allcnn"
 
 # 超参数取值范围
 FAIR_RANK_LIST=(8 12 16)
-FAIR_TAU_MODES=("mean" "median" "max")
+FAIR_TAU_MODES=("mean" "median")
 FAIR_FISHER_BATCHES=(5 10 20)
 FAIR_ERASE_SCALES=(0.2 0.4 0.6)
 FORGET_CLIENTS=(5)
-
-# 日志文件目录（集中存放）
-LOG_DIR="./logs/fairvue_grid"
-mkdir -p "$LOG_DIR"
 
 # 循环执行实验
 for CID in "${FORGET_CLIENTS[@]}"; do
@@ -36,16 +32,11 @@ for CID in "${FORGET_CLIENTS[@]}"; do
       for FISHER_B in "${FAIR_FISHER_BATCHES[@]}"; do
         for ERASE_S in "${FAIR_ERASE_SCALES[@]}"; do
 
-          # 构造日志文件名（干净安全）
-          LOG_NAME="client${CID}_k${RANK_K}_tau${TAU_MODE}_fb${FISHER_B}_es${ERASE_S}.log"
-          LOG_PATH="${LOG_DIR}/${LOG_NAME}"
-
           echo "=============================="
           echo "🚀 正在执行：client=${CID}, k=${RANK_K}, tau=${TAU_MODE}, fb=${FISHER_B}, es=${ERASE_S}"
-          echo "日志输出: ${LOG_PATH}"
           echo "=============================="
 
-          # 执行命令并保存日志
+          # 执行命令（不保存日志，仅输出到控制台）
           python3 main.py \
             --exp_name $EXP_NAME \
             --dataset $DATASET \
@@ -66,11 +57,10 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --fair_tau_mode $TAU_MODE \
             --fair_fisher_batches $FISHER_B \
             --fair_erase_scale $ERASE_S \
-            --fair_vue_debug \
-            --skip_retraining \
-            --unlearn_only \
-            --full_training_dir $FULL_TRAIN_DIR \
-            > "${LOG_PATH}" 2>&1
+            --fair_vue_debug true \
+            --skip_retraining true \
+            --skip_training true \
+            --full_training_dir $FULL_TRAIN_DIR
 
           echo "✅ 完成：client=${CID}, k=${RANK_K}, tau=${TAU_MODE}, fb=${FISHER_B}, es=${ERASE_S}"
           echo
@@ -80,4 +70,4 @@ for CID in "${FORGET_CLIENTS[@]}"; do
   done
 done
 
-echo "🎯 所有实验完成！日志已保存到 ${LOG_DIR}/"
+echo "🎯 所有实验完成！"

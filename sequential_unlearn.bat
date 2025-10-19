@@ -1,39 +1,72 @@
 @echo off
-setlocal enabledelayedexpansion
+REM ============================================
+REM FairVUE 参数搜索（去除日志写入，仅控制台输出）
+REM 保持 --exp_name 不变
+REM ============================================
 
-set FORGET_LIST=0 1 2 3 4 5 6 7 8 9
+REM 固定参数
+set DATASET=cifar10
+set MODEL=allcnn
+set OPTIMIZER=sgd
+set TOTAL_CLIENTS=10
+set ITERS=40
+set DEVICE=cuda
+set LR=0.03
+set EPOCHS=1
+set SEED=42
+set FULL_TRAIN_DIR=./experiments/cifar10_allcnn/full_training
+set DISTRIBUTION=dirichlet
+set EXP_NAME=cifar10_allcnn
 
-for %%C in (%FORGET_LIST%) do (
-  echo ==============================
-  echo 正在遗忘客户端 %%C ...
-  echo ==============================
+REM 超参数取值范围
+set FAIR_RANK_LIST=8 12 16
+set FAIR_TAU_MODES=mean median
+set FAIR_FISHER_BATCHES=5 10 20
+set FAIR_ERASE_SCALES=0.2 0.4 0.6
+set FORGET_CLIENTS=5
 
-  python main.py ^
-    --exp_name cifar10_allcnn ^
-    --dataset cifar10 ^
-    --optimizer sgd ^
-    --total_num_clients 10 ^
-    --num_training_iterations 40 ^
-    --forget_clients %%C ^
-    --model allcnn ^
-    --device cuda ^
-    --num_workers 0 ^
-    --lr 0.03 ^
-    --client_data_distribution dirichlet ^
-    --num_participating_clients -1 ^
-    --seed 42 ^
-    --num_local_epochs 1 ^
-    --fair_rank_k 12 ^
-    --fair_tau_mode median ^
-    --fair_fisher_batches 10 ^
-    --fair_erase_scale 0.2 ^
-    --fair_vue_debug ^
-    --unlearn_only ^
-    --full_training_dir ./experiments/cifar10_allcnn/full_training
+REM 循环执行实验
+for %%C in (%FORGET_CLIENTS%) do (
+  for %%R in (%FAIR_RANK_LIST%) do (
+    for %%T in (%FAIR_TAU_MODES%) do (
+      for %%F in (%FAIR_FISHER_BATCHES%) do (
+        for %%E in (%FAIR_ERASE_SCALES%) do (
+          echo ==============================
+          echo 🚀 正在执行：client=%%C, k=%%R, tau=%%T, fb=%%F, es=%%E
+          echo ==============================
 
-  echo ✅ 客户端 %%C 遗忘完成。
-  echo.
+          python main.py ^
+            --exp_name %EXP_NAME% ^
+            --dataset %DATASET% ^
+            --optimizer %OPTIMIZER% ^
+            --total_num_clients %TOTAL_CLIENTS% ^
+            --num_training_iterations %ITERS% ^
+            --forget_clients %%C ^
+            --model %MODEL% ^
+            --device %DEVICE% ^
+            --num_workers 0 ^
+            --lr %LR% ^
+            --client_data_distribution %DISTRIBUTION% ^
+            --num_participating_clients -1 ^
+            --seed %SEED% ^
+            --num_local_epochs %EPOCHS% ^
+            --baselines fair_vue ^
+            --fair_rank_k %%R ^
+            --fair_tau_mode %%T ^
+            --fair_fisher_batches %%F ^
+            --fair_erase_scale %%E ^
+            --fair_vue_debug true ^
+            --skip_retraining true ^
+            --skip_training true ^
+            --full_training_dir %FULL_TRAIN_DIR%
+
+          echo ✅ 完成：client=%%C, k=%%R, tau=%%T, fb=%%F, es=%%E
+          echo.
+        )
+      )
+    )
+  )
 )
 
-echo 🎯 全部顺序遗忘任务完成！
+echo 🎯 所有实验完成！
 pause
