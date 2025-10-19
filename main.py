@@ -511,7 +511,8 @@ if __name__ == "__main__":
         if not ckpt_path:
             raise RuntimeError("[Unlearn-Only] 未找到可用的全局模型权重（final_model.pth 或最后一轮的 global_model.pth）")
 
-        global_model.load_state_dict(torch.load(ckpt_path, map_location=args.device))
+        state_dict = torch.load(ckpt_path, map_location=args.device, weights_only=True)
+        global_model.load_state_dict(state_dict)
         print(f"[Unlearn-Only] 复用训练结果：{ckpt_path}")
     else:
         # 照常训练（注意 fed_train 会清空 weights_path）
