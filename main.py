@@ -23,8 +23,8 @@ from FedUnlearner.baselines import run_pga, run_fed_eraser
 from FedUnlearner.attacks.mia import train_attack_model, evaluate_mia_attack
 from FedUnlearner.attacks.poisoning import create_poisoning_dataset, evaluate_poisoning_attack
 
-# 模型治疗
-from FedUnlearner.baselines.fair_vue.healing import selective_kd_heal
+# 模型治疗（方案1：参数平滑）
+from FedUnlearner.baselines.fair_vue.healing import weight_interpolate_heal
 
 # >>> FAIR-VUE: imports
 from FedUnlearner.baselines.fair_vue.fisher import empirical_fisher_diagonal
@@ -304,6 +304,8 @@ parser.add_argument("--output_weight_path", type=str, default="")
 # ==== HEAL / 模型治疗参数 ====
 parser.add_argument('--heal', action='store_true',
                     help='开启治疗阶段（FAIR-VUE 擦除后运行 healing）')
+parser.add_argument('--heal_alpha', type=float, default=0.05,
+                    help='权重插值系数 α，student←(1-α)student+α·teacher，建议 0.02~0.10')
 parser.add_argument('--heal_steps', type=int, default=80,
                     help='治疗步数（迭代批次数）')
 parser.add_argument('--heal_lr', type=float, default=1e-4,
@@ -901,55 +903,23 @@ if __name__ == "__main__":
                 for p in teacher.parameters():
                     p.requires_grad_(False)
 
-                # 2) 组治疗数据：拼 retain 客户端
-                from torch.utils.data import ConcatDataset, DataLoader
-                retain_datasets = [clientwise_dataset[cid] for cid in clientwise_dataset
-                                if cid not in args.forget_clients]
-                heal_dataset = ConcatDataset(retain_datasets)
-                hb = args.heal_batch_size if args.heal_batch_size else args.batch_size
-                
-                from collections import Counter
-                from torch.utils.data import WeightedRandomSampler
+            # 2) 方案1：一次性权重插值（Data-Free；不会触碰任意原始样本）
+            if args.heal_teacher == 'post':
+                    print("[HEAL] teacher=post 与 student 相同，插值将不生效；如需恢复请使用 --heal_teacher pre")
+            weight_interpolate_heal(
+                student=fair_model,
+                teacher=teacher,
+                alpha=args.heal_alpha
+            )
 
-                targets = []
-                for ds in retain_datasets:
-                    # 假设 ds[i] -> (x, y)，y 是 int
-                    targets.extend([ds[i][1] for i in range(len(ds))])
-
-                cls_count = Counter(targets)
-                total = sum(cls_count.values())
-                # 每类的采样权重 = 1/频次
-                weights = [1.0 / cls_count[y] for y in targets]
-                sampler = WeightedRandomSampler(weights, num_samples=total, replacement=True)
-
-                heal_loader = DataLoader(heal_dataset, batch_size=hb,
-                                        sampler=sampler,  # 用 sampler 而不是 shuffle
-                                        num_workers=args.num_workers)
-
-                # 3) 触发治疗（参数来自命令行）
-                selective_kd_heal(
-                    student=fair_model,
-                    teacher=teacher,
-                    dataloader=heal_loader,
-                    v_spec=V_spec,
-                    num_steps=args.heal_steps,
-                    lr=args.heal_lr,
-                    T=args.heal_T,
-                    lambda_kd=args.heal_lambda_kd,
-                    lambda_ortho=args.heal_lambda_ortho,
-                    device=args.device,
-                    keys=param_keys,               # 与 V_spec 的参数展开顺序对齐
-                    grad_project=not args.no_heal_grad_proj
-                )
-
-                # 4) 治疗后评测
-                perf_heal = get_performance(model=fair_model, test_dataloader=test_dataloader,
-                                            clientwise_dataloader=clientwise_dataloaders,
-                                            num_classes=num_classes, device=args.device)
-                print(f"[HEAL] Performance after healing : {perf_heal}")
-                forget_loader = clientwise_dataloaders[target_id]
-                acc_forget_heal = get_accuracy_only(fair_model, forget_loader, args.device)
-                print(f"[HEAL] 忘却客户端{target_id}自有数据精度(治疗后): {acc_forget_heal*100:.2f}%")
+            # 4) 治疗后评测
+            perf_heal = get_performance(model=fair_model, test_dataloader=test_dataloader,
+                                        clientwise_dataloader=clientwise_dataloaders,
+                                        num_classes=num_classes, device=args.device)
+            print(f"[HEAL] Performance after healing : {perf_heal}")
+            forget_loader = clientwise_dataloaders[target_id]
+            acc_forget_heal = get_accuracy_only(fair_model, forget_loader, args.device)
+            print(f"[HEAL] 忘却客户端{target_id}自有数据精度(治疗后): {acc_forget_heal*100:.2f}%")
 
         # ----------------- FedFIM -----------------
     if "fedfim" in args.baselines:
