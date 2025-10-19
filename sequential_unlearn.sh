@@ -2,7 +2,7 @@
 # 顺序遗忘多个客户端（严格保留用户命令参数）
 
 # 依次遗忘的客户端编号列表
-FORGET_LIST=(1 3 5 7 9)
+FORGET_LIST=(7 8 9)
 
 for CID in "${FORGET_LIST[@]}"; do
   echo "=============================="
@@ -30,7 +30,6 @@ for CID in "${FORGET_LIST[@]}"; do
     --fair_fisher_batches 10 \
     --fair_erase_scale 0.2 \
     --fair_vue_debug \
-    --skip_retraining \
     --unlearn_only \
     --full_training_dir ./experiments/cifar10_allcnn/full_training
 
