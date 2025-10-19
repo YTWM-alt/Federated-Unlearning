@@ -903,23 +903,23 @@ if __name__ == "__main__":
                 for p in teacher.parameters():
                     p.requires_grad_(False)
 
-            # 2) 方案1：一次性权重插值（Data-Free；不会触碰任意原始样本）
-            if args.heal_teacher == 'post':
-                    print("[HEAL] teacher=post 与 student 相同，插值将不生效；如需恢复请使用 --heal_teacher pre")
-            weight_interpolate_heal(
-                student=fair_model,
-                teacher=teacher,
-                alpha=args.heal_alpha
-            )
+                # 2) 方案1：一次性权重插值（Data-Free；不会触碰任意原始样本）
+                if args.heal_teacher == 'post':
+                        print("[HEAL] teacher=post 与 student 相同，插值将不生效；如需恢复请使用 --heal_teacher pre")
+                weight_interpolate_heal(
+                    student=fair_model,
+                    teacher=teacher,
+                    alpha=args.heal_alpha
+                )
 
-            # 4) 治疗后评测
-            perf_heal = get_performance(model=fair_model, test_dataloader=test_dataloader,
-                                        clientwise_dataloader=clientwise_dataloaders,
-                                        num_classes=num_classes, device=args.device)
-            print(f"[HEAL] Performance after healing : {perf_heal}")
-            forget_loader = clientwise_dataloaders[target_id]
-            acc_forget_heal = get_accuracy_only(fair_model, forget_loader, args.device)
-            print(f"[HEAL] 忘却客户端{target_id}自有数据精度(治疗后): {acc_forget_heal*100:.2f}%")
+                # 4) 治疗后评测
+                perf_heal = get_performance(model=fair_model, test_dataloader=test_dataloader,
+                                            clientwise_dataloader=clientwise_dataloaders,
+                                            num_classes=num_classes, device=args.device)
+                print(f"[HEAL] Performance after healing : {perf_heal}")
+                forget_loader = clientwise_dataloaders[target_id]
+                acc_forget_heal = get_accuracy_only(fair_model, forget_loader, args.device)
+                print(f"[HEAL] 忘却客户端{target_id}自有数据精度(治疗后): {acc_forget_heal*100:.2f}%")
 
         # ----------------- FedFIM -----------------
     if "fedfim" in args.baselines:
