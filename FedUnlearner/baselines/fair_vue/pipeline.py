@@ -28,7 +28,11 @@ def fair_vue_unlearn(global_model: torch.nn.Module,
                      rank_k: int = 8,
                      tau_mode: str = "median",
                      fisher_batches: int = 10,
-                     device: str = "cpu") -> Dict[str, torch.Tensor]:
+                     device: str = "cpu",
+                     *,
+                     # 新增：客户端 Fisher 端点或回调（任选其一）。两者都缺省时，将不触碰原始数据，回退为单位权重。
+                     client_endpoints: Dict[int, object] = None,
+                     compute_fisher_fn=None) -> Dict[str, torch.Tensor]:
     """
     FAIR-VUE 无分簇版：Fisher加权+SVD特征方向+ρ划分+全局投影遗忘
     """
@@ -46,14 +50,26 @@ def fair_vue_unlearn(global_model: torch.nn.Module,
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    if target_id in clientwise_dataloaders:
-        fisher = empirical_fisher_diagonal(
-            global_model,
-            clientwise_dataloaders[target_id],
+    # === 改动点：禁止服务端直接用 dataloader 计算 Fisher ===
+    # 优先通过“客户端端点/回调”在本地计算 Fisher，对服务端仅回传对角统计量
+    fisher = None
+    if client_endpoints is not None and target_id in client_endpoints:
+        # 端点协议：.compute_fisher(model_state_dict=..., device=..., max_batches=...)
+        fisher = client_endpoints[target_id].compute_fisher(
+            model_state_dict=global_model.state_dict(),
             device=device,
             max_batches=fisher_batches
         )
-    else:
+    elif callable(compute_fisher_fn):
+        # 自定义回调协议：compute_fisher_fn(target_id=..., model_state_dict=..., device=..., max_batches=...)
+        fisher = compute_fisher_fn(
+            target_id=target_id,
+            model_state_dict=global_model.state_dict(),
+            device=device,
+            max_batches=fisher_batches
+        )
+    # 若没有端点/回调，则回退为单位权重（不触碰原始样本）
+    if fisher is None:
         fisher = {k: torch.ones_like(v) for k, v in start_sd.items()}
     # 子空间
     Xw = weighted_matrix_from_deltas(target_deltas, fisher)

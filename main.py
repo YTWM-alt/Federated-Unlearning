@@ -458,6 +458,61 @@ if __name__ == "__main__":
         client_dataloader = torch.utils.data.DataLoader(
             client_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
         clientwise_dataloaders[client_id] = client_dataloader
+    
+    # === 本地 Fisher 端点：客户端持有数据；服务端仅“请求 Fisher”，不触碰原始样本 ===
+    def _build_fresh_model_for_args(args):
+        # 与上面创建全局模型的分支保持一致，客户端本地重建同构模型
+        if args.model == 'allcnn':
+            if args.dataset == 'mnist':
+                return AllCNN(num_classes=num_classes, num_channels=1)
+            else:
+                return AllCNN(num_classes=num_classes)
+        elif args.model == 'resnet18':
+            if args.dataset == 'mnist':
+                return ResNet18(num_classes=num_classes, pretrained=args.pretrained, num_channels=1)
+            else:
+                return ResNet18(num_classes=num_classes, pretrained=args.pretrained)
+        elif args.model == 'smallcnn':
+            in_ch = 1 if args.dataset == 'mnist' else 3
+            return SmallCNN(num_channels=in_ch, num_classes=num_classes)
+        else:
+            raise ValueError("Invalid model name")
+
+    class LocalClientEndpoint:
+        """
+        轻量“RPC”端点：模拟把模型权重下发到客户端，
+        由客户端在本地数据上计算 Fisher 对角并上传（仅上传统计量，不上传原始样本）。
+        """
+        def __init__(self, cid, dataloader, args):
+            self.cid = cid
+            self.loader = dataloader
+            self.args = args
+
+        def compute_fisher(self, model_state_dict, device="cpu", max_batches=10):
+            # 客户端本地重建同构模型并载入服务端下发的参数
+            model = _build_fresh_model_for_args(self.args)
+            # 若服务端权重来自 DataParallel，自动去除 'module.' 前缀以与本地裸模型对齐
+            ref_keys = list(model.state_dict().keys())
+            if all(k.startswith("module.") for k in model_state_dict.keys()) and \
+               not any(k.startswith("module.") for k in ref_keys):
+                model_state_dict = {k.replace("module.", "", 1): v for k, v in model_state_dict.items()}
+            ret = model.load_state_dict(model_state_dict, strict=True)
+            # 严格校验，避免 BN buffer / 参数名不一致导致的静默偏差
+            assert len(ret.missing_keys) == 0 and len(ret.unexpected_keys) == 0, \
+                f"Incompatible keys when loading endpoint model: {ret}"
+            # 用原始算法计算经验 Fisher 对角近似（保持算法不变）
+            return empirical_fisher_diagonal(
+                model=model,
+                dataloader=self.loader,
+                device=device,
+                max_batches=max_batches
+            )
+
+    # 为每个客户端建立一个端点（仅保存回调，不暴露原始数据给服务端使用）
+    client_endpoints = {
+        cid: LocalClientEndpoint(cid, loader, args)
+        for cid, loader in clientwise_dataloaders.items()
+    }    
     test_dataloader = torch.utils.data.DataLoader(
         test_dataset, batch_size=args.batch_size*2, shuffle=False, num_workers=args.num_workers)
 
@@ -800,16 +855,21 @@ if __name__ == "__main__":
                 print(f"[FV-DBG] target_id={target_id}, T=len(target_deltas_list)={len(target_deltas_list)}, "
                     f"M=len(other_deltas_list)={len(other_deltas_list)}")
 
-            # 3) Fisher（在目标客户端数据上估计对角Fisher）
-            if target_id in clientwise_dataloaders:
-                # 确保模型参数可求导
-                for p in fair_model.parameters():
-                    p.requires_grad_(True)
-                fisher = empirical_fisher_diagonal(fair_model, clientwise_dataloaders[target_id],
-                                                device=args.device, max_batches=args.fair_fisher_batches)
+            # 3) Fisher（遗忘指令下发 → 目标客户端本地计算 → 仅上传 Fisher 对角）
+            #    与 pipeline 保持一致：为 Fisher 批次固定随机性，避免抽样差异带来系统性偏移
+            import random, numpy as np, torch
+            torch.manual_seed(42); np.random.seed(42); random.seed(42)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            if target_id in client_endpoints:
+                fisher = client_endpoints[target_id].compute_fisher(
+                    model_state_dict=fair_model.state_dict(),
+                    device=args.device,
+                    max_batches=args.fair_fisher_batches
+                )
             else:
-                # fallback：如果没有目标客户端loader，就用全1权重
-                fisher = {k: torch.ones_like(v) for k, v in fair_model.state_dict().items()}
+                # fallback：没有端点时，仅对可训练参数使用单位权重
+                fisher = {name: torch.ones_like(p) for name, p in fair_model.named_parameters() if p.requires_grad}
 
             # === Fisher 计算完毕后，插入点 B ===
             if args.fair_vue_debug:
