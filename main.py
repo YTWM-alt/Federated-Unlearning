@@ -13,7 +13,10 @@ import re
 import io
 
 
-from FedUnlearner.utils import print_exp_details, print_clientwise_class_distribution
+from FedUnlearner.utils import (
+    print_exp_details, print_clientwise_class_distribution,
+    eval_ce_loss, cosine_angle_between_models, print_forgetting_metrics
+)
 from FedUnlearner.data_utils import get_dataset, create_dirichlet_data_distribution, create_iid_data_distribution
 from FedUnlearner.fed_learn import fed_train, get_performance
 from FedUnlearner.unlearn import unlearn as unlearn_ours
@@ -205,6 +208,53 @@ def _build_round_deltas(train_path: str, total_clients: int):
     return round_client_deltas
 
 
+# ---- MIA 结果瘦身：只保留标量，丢弃巨大数组，便于写入 summary.json ----
+def _shrink_mia_result(res):
+    """
+    接受 evaluate_mia_attack 的任意返回（dict/tuple/ndarray/tensor/str），
+    仅抽取四个标量：accuracy / precision / recall / f1。
+    """
+    if res is None:
+        return None
+    def _to_float(x):
+        try:
+            import numpy as _np, torch as _torch
+            if isinstance(x, (list, tuple)) and x:
+                return float(sum(_to_float(v) for v in x)/len(x))
+            if '_torch' in locals() and isinstance(x, _torch.Tensor):
+                return float(x.mean().item())
+            if '_np' in locals() and isinstance(x, _np.ndarray):
+                return float(x.mean())
+            return float(x)
+        except Exception:
+            return None
+    acc=prec=rec=f1=None
+    if isinstance(res, dict):
+        m={k.lower().replace('-','_'):k for k in res.keys()}
+        def g(*names):
+            for n in names:
+                if n in m: return res[m[n]]
+            # 包含匹配：支持 mia_attacker_precision 等
+            for lk, ok in m.items():
+                if any(n in lk for n in names):
+                    return res[ok]
+            return None
+        acc = g('accuracy','acc')
+        prec= g('precision','precision_score')
+        rec = g('recall','recall_score')
+        f1  = g('f1','f1_score')
+    elif isinstance(res, (list, tuple)):
+        if len(res)>0: prec=res[0]
+        if len(res)>1: rec =res[1]
+        if len(res)>2: f1  =res[2]
+    # 返回统一瘦身结果
+    return {
+        'accuracy': _to_float(acc),
+        'precision': _to_float(prec),
+        'recall': _to_float(rec),
+        'f1': _to_float(f1),
+    }
+
 
 # create argument parser
 parser = argparse.ArgumentParser(description='FedUnlearner')
@@ -263,6 +313,8 @@ parser.add_argument('--backdoor_label', type=int,
 # membership inference attack related arguments
 parser.add_argument('--apply_membership_inference', type=str2bool, default=False,
                     help='是否启用成员推理攻击（True/False）')
+parser.add_argument('--mia_scope', type=str, choices=['none','fair_only','all'], default='fair_only',
+                    help="成员推断范围：none 不跑；fair_only 仅 FAIR-VUE 那一次；all 还会在后处理区块对 retrain/其他基线再跑")
 parser.add_argument('--attack_type', type=str, default='blackbox', choices=["blackbox", "whitebox"],
                     help='attack type')
 
@@ -671,12 +723,15 @@ if __name__ == "__main__":
                                      if key not in args.forget_clients}
     print(f"Retain Client wise Loaders: {retain_clientwise_dataloaders}")
 
+    # === 计时：重训基线（供 Speedup 对比） ===
+    t_retrain_sec = None
     if not args.skip_retraining:
-
+        _t0 = time.time()
         retrained_global_model = fed_train(num_training_iterations=args.num_training_iterations, test_dataloader=test_dataloader,
                                         clientwise_dataloaders=retain_clientwise_dataloaders,
                                         global_model=retrained_global_model, num_local_epochs=args.num_local_epochs,
                                         device=args.device, weights_path=retrain_path, lr=args.lr, optimizer_name=args.optimizer)
+        t_retrain_sec = time.time() - _t0
 
         perf = get_performance(model=retrained_global_model, test_dataloader=test_dataloader,
                             clientwise_dataloader=clientwise_dataloaders,
@@ -684,6 +739,7 @@ if __name__ == "__main__":
         summary['performance']['after_retraining'] = perf
         if args.verbose:
             print(f"Performance after retraining : {perf}")
+            print(f"[Timing] Retrain baseline time: {t_retrain_sec:.2f}s" if t_retrain_sec is not None else "[Timing] Retrain baseline time: NA")
         # evaluate attack accuracy on retrained model
 
         # ---- 专门测忘却客户端的精度 ----
@@ -721,6 +777,7 @@ if __name__ == "__main__":
     baselines_methods = args.baselines
     for baseline in baselines_methods:
         if baseline == 'pga':
+            _t0 = time.time()
             global_model_pga = deepcopy(global_model)
             unlearned_pga_model = run_pga(global_model=global_model_pga,
                                           weights_path=train_path,
@@ -741,6 +798,8 @@ if __name__ == "__main__":
             perf = get_performance(model=unlearned_pga_model, test_dataloader=test_dataloader,
                                    clientwise_dataloader=clientwise_dataloaders, num_classes=num_classes,
                                    device=args.device)
+            pga_time_sec = time.time() - _t0
+            print(f"[Timing] PGA time: {pga_time_sec:.2f}s")
             summary['performance']['after_pga'] = perf
             if args.verbose:
                 print(f"Performance after pga : {perf}")
@@ -762,7 +821,28 @@ if __name__ == "__main__":
                 if args.verbose:
                     print(
                         f"Poisoning results after pga : {forget_poisoning_pga}")
+
+
+            # ==== 六项指标统一打印（PGA）====
+            test_acc_pga    = get_accuracy_only(unlearned_pga_model, test_dataloader, args.device)
+            target_acc_pga  = get_accuracy_only(unlearned_pga_model, clientwise_dataloaders[forget_client], args.device)
+            target_loss_pga = eval_ce_loss(unlearned_pga_model, clientwise_dataloaders[forget_client], args.device)
+            speedup_pga     = (t_retrain_sec / pga_time_sec) if (t_retrain_sec is not None and pga_time_sec > 0) else None
+            angle_pga       = cosine_angle_between_models(unlearned_pga_model, retrained_global_model) if (not args.skip_retraining) else None
+            mia_pga = None
+            if args.apply_membership_inference:
+                mia_pga = evaluate_mia_attack(
+                    target_model=deepcopy(unlearned_pga_model),
+                    attack_model=attack_model,
+                    client_loaders=clientwise_dataloaders,
+                    test_loader=test_dataloader,
+                    dataset=args.dataset,
+                    forget_client_idx=args.forget_clients[0],
+                    device=args.device
+                )
+            print_forgetting_metrics("PGA", test_acc_pga, target_acc_pga, target_loss_pga, speedup_pga, angle_pga, mia_pga)
         elif baseline == 'fed_eraser':
+            _t0 = time.time()
             global_model_federaser = deepcopy(global_model)
             unlearned_federaser_model = run_fed_eraser(global_model=global_model_federaser,
                                                        weights_path=train_path,
@@ -779,6 +859,8 @@ if __name__ == "__main__":
             perf = get_performance(model=unlearned_federaser_model, test_dataloader=test_dataloader,
                                    clientwise_dataloader=clientwise_dataloaders, num_classes=num_classes,
                                    device=args.device)
+            federaser_time_sec = time.time() - _t0
+            print(f"[Timing] FedEraser time: {federaser_time_sec:.2f}s")
             summary['performance']['after_federaser'] = perf
             if args.verbose:
                 print(f"Performance after federaser : {perf}")
@@ -800,10 +882,31 @@ if __name__ == "__main__":
                 if args.verbose:
                     print(
                         f"Poisoning results after federaser : {forget_poisoning_federaser}")
+
+
+            # ==== 六项指标统一打印（FedEraser）====
+            test_acc_fe    = get_accuracy_only(unlearned_federaser_model, test_dataloader, args.device)
+            target_acc_fe  = get_accuracy_only(unlearned_federaser_model, clientwise_dataloaders[forget_client], args.device)
+            target_loss_fe = eval_ce_loss(unlearned_federaser_model, clientwise_dataloaders[forget_client], args.device)
+            speedup_fe     = (t_retrain_sec / federaser_time_sec) if (t_retrain_sec is not None and federaser_time_sec > 0) else None
+            angle_fe       = cosine_angle_between_models(unlearned_federaser_model, retrained_global_model) if (not args.skip_retraining) else None
+            mia_fe = None
+            if args.apply_membership_inference:
+                mia_fe = evaluate_mia_attack(
+                    target_model=deepcopy(unlearned_federaser_model),
+                    attack_model=attack_model,
+                    client_loaders=clientwise_dataloaders,
+                    test_loader=test_dataloader,
+                    dataset=args.dataset,
+                    forget_client_idx=args.forget_clients[0],
+                    device=args.device
+                )
+            print_forgetting_metrics("FedEraser", test_acc_fe, target_acc_fe, target_loss_fe, speedup_fe, angle_fe, mia_fe)
         elif baseline == 'fair_vue':
             
             # ---- FAIR-VUE（按轮）----
             print(">>> Running FAIR-VUE (round-wise)...")
+            _t0 = time.time()
             fair_model = deepcopy(global_model).to(args.device)
             fair_model.eval()
             param_keys = [name for name, p in fair_model.named_parameters() if p.requires_grad]
@@ -983,6 +1086,8 @@ if __name__ == "__main__":
             perf = get_performance(model=fair_model, test_dataloader=test_dataloader,
                                 clientwise_dataloader=clientwise_dataloaders,
                                 num_classes=num_classes, device=args.device)
+            fair_time_sec = time.time() - _t0
+            print(f"[Timing] FAIR-VUE time: {fair_time_sec:.2f}s")
             summary.setdefault('performance', {})
             summary['performance']['after_fair_vue'] = perf
             if args.verbose:
@@ -992,6 +1097,60 @@ if __name__ == "__main__":
             forget_loader = clientwise_dataloaders[target_id]
             acc = get_accuracy_only(fair_model, forget_loader, args.device)
             print(f"[FAIR-VUE模型] 忘却客户端{target_id}自有数据精度: {acc*100:.2f}%")
+
+            # ==== 六项指标统一打印（FAIR-VUE）====
+            test_acc_fair    = get_accuracy_only(fair_model, test_dataloader, args.device)
+            target_acc_fair  = acc
+            target_loss_fair = eval_ce_loss(fair_model, forget_loader, args.device)
+            speedup_fair     = (t_retrain_sec / fair_time_sec) if (t_retrain_sec is not None and fair_time_sec > 0) else None
+            angle_fair       = cosine_angle_between_models(fair_model, retrained_global_model) if (not args.skip_retraining) else None
+
+            mia_fair = None
+            if args.apply_membership_inference and args.mia_scope in ('fair_only','all'):
+                print("\n[调试] 开始执行成员推断攻击 (evaluate_mia_attack)...")
+                # 与其他分支保持一致：对目标客户端执行成员推断
+                mia_fair = evaluate_mia_attack(
+                    target_model=deepcopy(fair_model),
+                    attack_model=attack_model,
+                    client_loaders=clientwise_dataloaders,
+                    test_loader=test_dataloader,
+                    dataset=args.dataset,
+                    forget_client_idx=args.forget_clients[0],
+                    device=args.device
+                )
+                print(f"[调试] MIA 返回类型: {type(mia_fair)}")
+                if isinstance(mia_fair, dict):
+                    print(f"[调试] MIA 字典键: {list(mia_fair.keys())[:10]}")  # 仅打印前10个键
+                    for k, v in list(mia_fair.items())[:5]:                   # 仅前5个键值
+                        if isinstance(v, (int, float, str)):
+                            print(f"  {k}: {v}")
+                        elif hasattr(v, 'shape'):
+                            print(f"  {k}: tensor/array shape={v.shape}")
+                        elif isinstance(v, (list, tuple)):
+                            print(f"  {k}: list length={len(v)}")
+                        else:
+                            print(f"  {k}: type={type(v)}")
+            print_forgetting_metrics(
+                method_name="FAIR-VUE",
+                test_acc=test_acc_fair,
+                target_acc=target_acc_fair,
+                target_loss=target_loss_fair,
+                speedup_x=speedup_fair,
+                angle_deg=angle_fair,
+                mia_result=mia_fair
+            )
+            # —— 关键：清理 MIA 大对象并同步 CUDA，避免后续卡住 —— 
+            try:
+                import torch, gc
+                if isinstance(mia_fair, dict):
+                    for k in ['mia_attacker_predictions','mia_attacker_probabilities','predictions','probabilities','scores']:
+                        if k in mia_fair: mia_fair.pop(k, None)
+                if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                gc.collect()
+            except Exception:
+                pass
 
 
 
@@ -1115,8 +1274,21 @@ if __name__ == "__main__":
                     f"Poisoning results after unlearning : {forget_poisoning_attacks}")
     # check mia precision and recall on all model
     summary['mia_attack'] = {}
-    if args.apply_membership_inference:
+    if args.apply_membership_inference and args.mia_scope=='all':
+        import time as _t, gc as _gc
+        import torch as _torch
+        def _sync_cuda():
+            try:
+                if _torch.cuda.is_available() and str(args.device).startswith("cuda"):
+                    _torch.cuda.synchronize()
+                    _torch.cuda.empty_cache()
+            except Exception:
+                pass
+            _gc.collect()
+
         if RUN_LEGACY_UNLEARN:
+            print("[MIA] 开始对 after_unlearning 模型执行成员推断...")
+            _t0=_t.time()
             unlearning_mia_result = evaluate_mia_attack(target_model=deepcopy(unlearned_global_model),
                                                         attack_model=attack_model,
                                                         client_loaders=clientwise_dataloaders,
@@ -1124,11 +1296,15 @@ if __name__ == "__main__":
                                                         dataset=args.dataset,
                                                         forget_client_idx=args.forget_clients[0],
                                                         device=args.device)
-            summary['mia_attack']['after_unlearning'] = unlearning_mia_result
+            print(f"[MIA] after_unlearning 完成，用时 {(_t.time()-_t0):.2f}s")
+            summary['mia_attack']['after_unlearning'] = _shrink_mia_result(unlearning_mia_result)
+            _sync_cuda()
             if args.verbose:
                 print(
                     f"MIA results after unlearning : {unlearning_mia_result}")
         if not args.skip_retraining:
+            print("[MIA] 开始对 retraining 模型执行成员推断...")
+            _t0=_t.time()
             retrained_mia_result = evaluate_mia_attack(target_model=deepcopy(retrained_global_model),
                                                     attack_model=attack_model,
                                                     client_loaders=clientwise_dataloaders,
@@ -1136,7 +1312,9 @@ if __name__ == "__main__":
                                                     dataset=args.dataset,
                                                     forget_client_idx=args.forget_clients[0],
                                                     device=args.device)
-            summary['mia_attack']['after_retraining'] = retrained_mia_result
+            print(f"[MIA] retraining 完成，用时 {(_t.time()-_t0):.2f}s")
+            summary['mia_attack']['after_retraining'] = _shrink_mia_result(retrained_mia_result)
+            _sync_cuda()
             if args.verbose:
                 print(
                     f"MIA results after retraining : {retrained_mia_result}")
@@ -1144,6 +1322,8 @@ if __name__ == "__main__":
         for baseline in baselines_methods:
             if baseline == 'pga':
 
+                print("[MIA] 开始对 PGA 模型执行成员推断...")
+                _t0=_t.time()
                 pga_mia_result = evaluate_mia_attack(target_model=deepcopy(unlearned_pga_model),
                                                      attack_model=attack_model,
                                                      client_loaders=clientwise_dataloaders,
@@ -1151,11 +1331,16 @@ if __name__ == "__main__":
                                                      dataset=args.dataset,
                                                      forget_client_idx=args.forget_clients[0],
                                                      device=args.device)
-                summary['mia_attack']['after_pga'] = pga_mia_result
+                print(f"[MIA] PGA 完成，用时 {(_t.time()-_t0):.2f}s")
+                summary['mia_attack']['after_pga'] = _shrink_mia_result(pga_mia_result)
+                _sync_cuda()
+                
                 if args.verbose:
                     print(
                         f"MIA results after pga : {pga_mia_result}")
             elif baseline == 'fed_eraser':
+                print("[MIA] 开始对 FedEraser 模型执行成员推断...")
+                _t0=_t.time()
                 federaser_mia_result = evaluate_mia_attack(target_model=deepcopy(unlearned_federaser_model),
                                                            attack_model=attack_model,
                                                            client_loaders=clientwise_dataloaders,
@@ -1163,7 +1348,9 @@ if __name__ == "__main__":
                                                            dataset=args.dataset,
                                                            forget_client_idx=args.forget_clients[0],
                                                            device=args.device)
-                summary['mia_attack']['after_federaser'] = federaser_mia_result
+                print(f"[MIA] FedEraser 完成，用时 {(_t.time()-_t0):.2f}s")
+                summary['mia_attack']['after_federaser'] = _shrink_mia_result(federaser_mia_result)
+                _sync_cuda()
                 if args.verbose:
                     print(
                         f"MIA results after federaser : {federaser_mia_result}")
