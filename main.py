@@ -351,6 +351,10 @@ parser.add_argument('--full_training_dir', type=str, default='',
                     help='已有的 full_training 目录（含 iteration_*/client_*.pth 和 final_model.pth）')
 parser.add_argument('--global_ckpt', type=str, default='',
                     help='可选：显式指定要加载的全局模型权重路径（.pth）')
+parser.add_argument('--retraining_dir', type=str, default='',
+                    help='当 --skip_retraining 时可用：已有的 retraining 目录（含 iteration_*/global_model.pth 或 final_model.pth）')
+parser.add_argument('--retrained_ckpt', type=str, default='',
+                    help='当 --skip_retraining 时可用：显式指定重训练基线的全局模型 .pth 路径')
 
 # FedFIM 参数
 parser.add_argument("--fim_max_batches", type=int, default=2)
@@ -725,6 +729,7 @@ if __name__ == "__main__":
 
     # === 计时：重训基线（供 Speedup 对比） ===
     t_retrain_sec = None
+    has_retrain_baseline = False
     if not args.skip_retraining:
         _t0 = time.time()
         retrained_global_model = fed_train(num_training_iterations=args.num_training_iterations, test_dataloader=test_dataloader,
@@ -732,6 +737,7 @@ if __name__ == "__main__":
                                         global_model=retrained_global_model, num_local_epochs=args.num_local_epochs,
                                         device=args.device, weights_path=retrain_path, lr=args.lr, optimizer_name=args.optimizer)
         t_retrain_sec = time.time() - _t0
+        has_retrain_baseline = True
 
         perf = get_performance(model=retrained_global_model, test_dataloader=test_dataloader,
                             clientwise_dataloader=clientwise_dataloaders,
@@ -748,8 +754,52 @@ if __name__ == "__main__":
             print(f"[Retrain模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
 
     else:
-        if args.verbose:
-            print("[Skip] 跳过重训练基线（--skip_retraining）")        
+        # 跳过重训：若用户提供了 retraining_dir / retrained_ckpt，则直接载入基线权重
+        import os, torch
+        ckpt_path = None
+        if args.retrained_ckpt:
+            ckpt_path = os.path.abspath(args.retrained_ckpt)
+            if not os.path.isfile(ckpt_path):
+                raise RuntimeError(f"[Skip-Retrain] 找不到指定的 --retrained_ckpt：{ckpt_path}")
+        elif args.retraining_dir:
+            rdir = os.path.abspath(args.retraining_dir)
+            if not os.path.isdir(rdir):
+                raise RuntimeError(f"[Skip-Retrain] 找不到指定的 --retraining_dir：{rdir}")
+            # 先尝试 final_model.pth，其次尝试最后一轮的 global_model.pth
+            last_iter = -1
+            for name in os.listdir(rdir):
+                if name.startswith("iteration_"):
+                    try:
+                        idx = int(name.split("_")[-1])
+                        last_iter = max(last_iter, idx)
+                    except Exception:
+                        pass
+            candidates = [
+                os.path.join(rdir, "final_model.pth"),
+                os.path.join(rdir, f"iteration_{last_iter}", "global_model.pth") if last_iter >= 0 else None
+            ]
+            ckpt_path = next((p for p in candidates if p and os.path.isfile(p)), None)
+            if not ckpt_path:
+                raise RuntimeError(f"[Skip-Retrain] 在 {rdir} 未找到 final_model.pth 或最后一轮 global_model.pth")
+
+        if ckpt_path:
+            state_dict = torch.load(ckpt_path, map_location=args.device, weights_only=True)
+            retrained_global_model.load_state_dict(state_dict)
+            has_retrain_baseline = True
+            print(f"[Skip-Retrain] 复用重训练基线：{ckpt_path}")
+            # 既然有了基线，也一起评测便于对照
+            perf = get_performance(model=retrained_global_model, test_dataloader=test_dataloader,
+                                   clientwise_dataloader=clientwise_dataloaders,
+                                   num_classes=num_classes, device=args.device)
+            summary['performance']['after_retraining'] = perf
+            if args.verbose:
+                print(f"Performance after (loaded) retraining : {perf}")
+            forget_loader = clientwise_dataloaders[forget_client]
+            acc = get_accuracy_only(retrained_global_model, forget_loader, args.device)
+            print(f"[Retrain(loaded)模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
+        else:
+            if args.verbose:
+                print("[Skip] 跳过重训练基线（--skip_retraining），且未提供 --retraining_dir / --retrained_ckpt")     
 
 
 
@@ -828,7 +878,7 @@ if __name__ == "__main__":
             target_acc_pga  = get_accuracy_only(unlearned_pga_model, clientwise_dataloaders[forget_client], args.device)
             target_loss_pga = eval_ce_loss(unlearned_pga_model, clientwise_dataloaders[forget_client], args.device)
             speedup_pga     = (t_retrain_sec / pga_time_sec) if (t_retrain_sec is not None and pga_time_sec > 0) else None
-            angle_pga       = cosine_angle_between_models(unlearned_pga_model, retrained_global_model) if (not args.skip_retraining) else None
+            angle_pga       = cosine_angle_between_models(unlearned_pga_model, retrained_global_model) if has_retrain_baseline else None
             mia_pga = None
             if args.apply_membership_inference:
                 mia_pga = evaluate_mia_attack(
@@ -889,7 +939,7 @@ if __name__ == "__main__":
             target_acc_fe  = get_accuracy_only(unlearned_federaser_model, clientwise_dataloaders[forget_client], args.device)
             target_loss_fe = eval_ce_loss(unlearned_federaser_model, clientwise_dataloaders[forget_client], args.device)
             speedup_fe     = (t_retrain_sec / federaser_time_sec) if (t_retrain_sec is not None and federaser_time_sec > 0) else None
-            angle_fe       = cosine_angle_between_models(unlearned_federaser_model, retrained_global_model) if (not args.skip_retraining) else None
+            angle_fe       = cosine_angle_between_models(unlearned_federaser_model, retrained_global_model) if has_retrain_baseline else None
             mia_fe = None
             if args.apply_membership_inference:
                 mia_fe = evaluate_mia_attack(
@@ -1103,7 +1153,7 @@ if __name__ == "__main__":
             target_acc_fair  = acc
             target_loss_fair = eval_ce_loss(fair_model, forget_loader, args.device)
             speedup_fair     = (t_retrain_sec / fair_time_sec) if (t_retrain_sec is not None and fair_time_sec > 0) else None
-            angle_fair       = cosine_angle_between_models(fair_model, retrained_global_model) if (not args.skip_retraining) else None
+            angle_fair       = cosine_angle_between_models(fair_model, retrained_global_model) if has_retrain_baseline else None
 
             mia_fair = None
             if args.apply_membership_inference and args.mia_scope in ('fair_only','all'):
