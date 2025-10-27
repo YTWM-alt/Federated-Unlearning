@@ -6,6 +6,20 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 from sklearn.model_selection import train_test_split
 import numpy as np
 from xgboost import XGBClassifier
+import os as _os
+
+# 读取 main.py 设置的环境变量；默认静音
+_MIA_VERBOSE = _os.environ.get("MIA_VERBOSE", "0").lower() in ("1", "true", "yes", "y")
+def mia_log(*args, **kwargs):
+    if _MIA_VERBOSE:
+        print(*args, **kwargs)
+
+# ---- shared helpers (模块级，供训练/评估两边共用) ----
+def _prob_stats(arr):
+    pmax = arr.max(axis=1)
+    ent  = -(arr * np.log(arr + 1e-12)).sum(axis=1)
+    return float(pmax.mean()), float(pmax.std()), float(ent.mean()), float(ent.std())
+
 
 """
 Membership Inference Attack from
@@ -31,8 +45,8 @@ def train_attack_model(shadow_global_model, shadow_client_loaders, shadow_test_l
     try:
         _mem_total = sum(len(dl.dataset) for dl in shadow_client_loaders.values())
         _nonmem_total = len(getattr(shadow_test_loader, "dataset", []))
-        print(f"[MIA-TRAIN] dataset={dataset} device={device} mem_total={_mem_total} nonmem_total={_nonmem_total} "
-              f"shadow_nonmem_ds_id={id(getattr(shadow_test_loader, 'dataset', object()))}")
+        mia_log(f"[MIA-TRAIN] dataset={dataset} device={device} mem_total={_mem_total} nonmem_total={_nonmem_total} "
+                f"shadow_nonmem_ds_id={id(getattr(shadow_test_loader, 'dataset', object()))}")
     except Exception as _e:
         print(f"[MIA-TRAIN][WARN] failed to read dataset sizes: {_e}")
     ####
@@ -56,16 +70,12 @@ def train_attack_model(shadow_global_model, shadow_client_loaders, shadow_test_l
     pred_4_nonmem = np.concatenate(pred_4_nonmem_list, axis=0)
 
     # —— 特征统计：max prob / entropy（成员 vs 非成员）——
-    def _prob_stats(arr):
-        pmax = arr.max(axis=1)
-        ent  = -(arr * np.log(arr + 1e-12)).sum(axis=1)
-        return float(pmax.mean()), float(pmax.std()), float(ent.mean()), float(ent.std())
     _m_mp_mu, _m_mp_sd, _m_ent_mu, _m_ent_sd = _prob_stats(pred_4_mem)
     _n_mp_mu, _n_mp_sd, _n_ent_mu, _n_ent_sd = _prob_stats(pred_4_nonmem)
-    print(f"[MIA-TRAIN] mem shape={pred_4_mem.shape} maxP μ={_m_mp_mu:.3f}±{_m_mp_sd:.3f} "
-          f"entropy μ={_m_ent_mu:.3f}±{_m_ent_sd:.3f}")
-    print(f"[MIA-TRAIN] nonmem shape={pred_4_nonmem.shape} maxP μ={_n_mp_mu:.3f}±{_n_mp_sd:.3f} "
-          f"entropy μ={_n_ent_mu:.3f}±{_n_ent_sd:.3f}")
+    mia_log(f"[MIA-TRAIN] mem shape={pred_4_mem.shape} maxP μ={_m_mp_mu:.3f}±{_m_mp_sd:.3f} "
+            f"entropy μ={_m_ent_mu:.3f}±{_m_ent_sd:.3f}")
+    mia_log(f"[MIA-TRAIN] nonmem shape={pred_4_nonmem.shape} maxP μ={_n_mp_mu:.3f}±{_n_mp_sd:.3f} "
+            f"entropy μ={_n_ent_mu:.3f}±{_n_ent_sd:.3f}")
 
 
     n = min(pred_4_mem.shape[0], pred_4_nonmem.shape[0])
@@ -73,7 +83,7 @@ def train_attack_model(shadow_global_model, shadow_client_loaders, shadow_test_l
     idx_nonmem = np.random.RandomState(1).choice(pred_4_nonmem.shape[0], size=n, replace=False)
     att_X = np.vstack((pred_4_mem[idx_mem], pred_4_nonmem[idx_nonmem]))
     att_y = np.hstack((np.ones(n), np.zeros(n))).astype(np.int16)
-    print(f"[MIA-TRAIN] downsample to 1:1 -> n_each={n}, att_X={att_X.shape}")
+    mia_log(f"[MIA-TRAIN] downsample to 1:1 -> n_each={n}, att_X={att_X.shape}")
 
     att_X.sort(axis=1)
 
@@ -93,8 +103,8 @@ def train_attack_model(shadow_global_model, shadow_client_loaders, shadow_test_l
                              random_state=0
                              )
 
-    print(f"[MIA-TRAIN] XGB params: n_estimators={attacker.n_estimators} max_depth={attacker.max_depth} "
-          f"scale_pos_weight={attacker.scale_pos_weight} random_state=0")
+    mia_log(f"[MIA-TRAIN] XGB params: n_estimators={attacker.n_estimators} max_depth={attacker.max_depth} "
+            f"scale_pos_weight={attacker.scale_pos_weight} random_state=0")
     attacker.fit(X_train, y_train)
     # —— holdout 验证，确认攻击器不是“全靠阈值” —— 
     try:
@@ -104,7 +114,7 @@ def train_attack_model(shadow_global_model, shadow_client_loaders, shadow_test_l
         _acc = accuracy_score(y_test, _pred)
         _f1  = f1_score(y_test, _pred)
         _auc = roc_auc_score(y_test, _proba)
-        print(f"[MIA-TRAIN] holdout acc={_acc:.3f} f1={_f1:.3f} auc={_auc:.3f} (X_test={X_test.shape[0]})")
+        mia_log(f"[MIA-TRAIN] holdout acc={_acc:.3f} f1={_f1:.3f} auc={_auc:.3f} (X_test={X_test.shape[0]})")
     except Exception as _e:
         print(f"[MIA-TRAIN][WARN] holdout eval failed: {_e}")
     return attacker
@@ -132,8 +142,8 @@ def evaluate_mia_attack(target_model: torch.nn.Module,
     # —— 目标模型“指纹”，确保真的换了模型 —— 
     try:
         _first = next(iter(target_model.parameters()))
-        print(f"[MIA-EVAL] target_model device={device} first_param μ={float(_first.data.mean()):.4e} "
-              f"σ={float(_first.data.std()):.4e} numel={_first.data.numel()}")
+        mia_log(f"[MIA-EVAL] target_model device={device} first_param μ={float(_first.data.mean()):.4e} "
+            f"σ={float(_first.data.std()):.4e} numel={_first.data.numel()}")
     except Exception:
         pass
 
@@ -154,16 +164,9 @@ def evaluate_mia_attack(target_model: torch.nn.Module,
 
     N_unlearn_sample = len(unlearn_y)
     # —— 成员 softmax 统计 —— 
-    try:
-        _mp_mu, _mp_sd, _ent_mu, _ent_sd = _prob_stats(unlearn_X)
-    except NameError:
-        def _prob_stats(arr):
-            pmax = arr.max(axis=1)
-            ent  = -(arr * np.log(arr + 1e-12)).sum(axis=1)
-            return float(pmax.mean()), float(pmax.std()), float(ent.mean()), float(ent.std())
-        _mp_mu, _mp_sd, _ent_mu, _ent_sd = _prob_stats(unlearn_X)
-    print(f"[MIA-EVAL] member N={N_unlearn_sample} softmax maxP μ={_mp_mu:.3f}±{_mp_sd:.3f} "
-          f"entropy μ={_ent_mu:.3f}±{_ent_sd:.3f}")
+    _mp_mu, _mp_sd, _ent_mu, _ent_sd = _prob_stats(unlearn_X)
+    mia_log(f"[MIA-EVAL] member N={N_unlearn_sample} softmax maxP μ={_mp_mu:.3f}±{_mp_sd:.3f} "
+            f"entropy μ={_ent_mu:.3f}±{_ent_sd:.3f}")
 
     # 评估用的“非成员”应来自与 shadow 训练不同的一部分测试数据，避免泄漏
     if eval_nonmem_loader is not None:
@@ -176,8 +179,8 @@ def evaluate_mia_attack(target_model: torch.nn.Module,
         _idx = getattr(_ds, "indices", None)
         _head = list(_idx[:5]) if _idx is not None else "NA"
         _tail = list(_idx[-5:]) if _idx is not None else "NA"
-        print(f"[MIA-EVAL] nonmember ds id={id(_ds)} len={len(_ds) if _ds is not None else 'NA'} "
-              f"indices_head={_head} ... tail={_tail}")
+        mia_log(f"[MIA-EVAL] nonmember ds id={id(_ds)} len={len(_ds) if _ds is not None else 'NA'} "
+                f"indices_head={_head} ... tail={_tail}")
     except Exception:
         pass
 
@@ -205,8 +208,8 @@ def evaluate_mia_attack(target_model: torch.nn.Module,
     _n_mem    = unlearn_X.shape[0]
     _n_tot    = _n_nonmem + _n_mem
     _mp_mu_n, _mp_sd_n, _ent_mu_n, _ent_sd_n = _prob_stats(test_X)
-    print(f"[MIA-EVAL] nonmember N={_n_nonmem} softmax maxP μ={_mp_mu_n:.3f}±{_mp_sd_n:.3f} "
-          f"entropy μ={_ent_mu_n:.3f}±{_ent_sd_n:.3f}")
+    mia_log(f"[MIA-EVAL] nonmember N={_n_nonmem} softmax maxP μ={_mp_mu_n:.3f}±{_mp_sd_n:.3f} "
+            f"entropy μ={_ent_mu_n:.3f}±{_ent_sd_n:.3f}")
 
     # The data of the forgotten user passed through the output of the target model, and the data of the test set passed through the output of the target model were spliced together
     # The balanced data set that forms the 50% train 50% test.
@@ -221,12 +224,14 @@ def evaluate_mia_attack(target_model: torch.nn.Module,
         import numpy as _np
         from sklearn.metrics import f1_score as _f1
         ths = _np.linspace(0.1, 0.9, 9)
-        f1_scan = [ _f1(combined_Y, (pred_proba_Y>=t).astype(int)) for t in ths ]
-        best_t = float(ths[int(_np.argmax(f1_scan))])
-        best_f1 = float(_np.max(f1_scan))
-        print(f"[MIA-DBG] F1@0.5={_f1(combined_Y, (pred_proba_Y>=0.5).astype(int)):.3f}; "
-            f"best_F1={best_f1:.3f} @ thr={best_t:.2f}")
-    except Exception:
+        f1_scan = [_f1(combined_Y, (pred_proba_Y >= t).astype(int)) for t in ths]
+        best_idx = int(_np.argmax(f1_scan))
+        best_t   = float(ths[best_idx])
+        best_f1  = float(f1_scan[best_idx])
+        f1_at_05 = float(_f1(combined_Y, (pred_proba_Y >= 0.5).astype(int)))
+        mia_log(f"[MIA-DBG] F1@0.5={f1_at_05:.3f}; best_F1={best_f1:.3f} @ thr={best_t:.2f}")
+    except Exception as _e:
+        mia_log(f"[MIA-DBG][WARN] f1-scan failed: {_e}")
         pass
 
     # —— AUC 与混淆矩阵（0.5 阈值）——
@@ -236,17 +241,17 @@ def evaluate_mia_attack(target_model: torch.nn.Module,
         _cm  = confusion_matrix(combined_Y, pred_Y)
         if _cm.size == 4:
             tn, fp, fn, tp = _cm.ravel()
-            print(f"[MIA-EVAL] AUC={_auc:.3f}  CM@0.5: tn={tn} fp={fp} fn={fn} tp={tp}  "
-                  f"N={_n_tot} (mem={_n_mem}, nonmem={_n_nonmem})")
+            mia_log(f"[MIA-EVAL] AUC={_auc:.3f}  CM@0.5: tn={tn} fp={fp} fn={fn} tp={tp}  "
+                    f"N={_n_tot} (mem={_n_mem}, nonmem={_n_nonmem})")
         else:
-            print(f"[MIA-EVAL] AUC={_auc:.3f}  CM shape={_cm.shape}")
+            mia_log(f"[MIA-EVAL] AUC={_auc:.3f}  CM shape={_cm.shape}")
         # 成员与非成员分开看预测概率
         _proba_mem = attack_model.predict_proba(unlearn_X)[:,1]
         _proba_non = attack_model.predict_proba(test_X)[:,1]
         import numpy as _np
         def _q(a): 
             return tuple(float(x) for x in _np.quantile(a, [0.1,0.5,0.9]))
-        print(f"[MIA-EVAL] proba(mem) q10/q50/q90={_q(_proba_mem)}  proba(non) q10/q50/q90={_q(_proba_non)}")
+        mia_log(f"[MIA-EVAL] proba(mem) q10/q50/q90={_q(_proba_mem)}  proba(non) q10/q50/q90={_q(_proba_non)}")
     except Exception as _e:
         print(f"[MIA-EVAL][WARN] AUC/CM diagnostics failed: {_e}")
 

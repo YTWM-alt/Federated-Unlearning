@@ -296,7 +296,7 @@ parser.add_argument('--fair_fisher_batches', type=int, default=5, help='Fisher�
 parser.add_argument('--fair_vue_debug', type=str2bool, default=False,
                     help='是否打印 FAIR-VUE 调试信息（True/False）')
 parser.add_argument('--fair_erase_scale', type=float, default=0.25,
-                    help='特异分量擦除强度 (0,1]，默认0.25，建议先小后大')         
+                    help='特异分量擦除强度 (0,1]，默认0.25，建议先小后大')
 parser.add_argument('--skip_retraining', type=str2bool, default=False,
                     help='是否跳过重训练阶段（True/False）')
 
@@ -313,6 +313,9 @@ parser.add_argument('--backdoor_label', type=int,
 # membership inference attack related arguments
 parser.add_argument('--apply_membership_inference', type=str2bool, default=False,
                     help='是否启用成员推理攻击（True/False）')
+# 是否打印 MIA 详细调试信息（默认不打印）
+parser.add_argument('--mia_verbose', type=str2bool, default=False,
+                        help='Print detailed diagnostics for MIA (default: false)')
 parser.add_argument('--mia_scope', type=str, choices=['none','fair_only','all'], default='fair_only',
                     help="成员推断范围：none 不跑；fair_only 仅 FAIR-VUE 那一次；all 还会在后处理区块对 retrain/其他基线再跑")
 parser.add_argument('--attack_type', type=str, default='blackbox', choices=["blackbox", "whitebox"],
@@ -401,6 +404,9 @@ parser.add_argument('--heal_batch_size', type=int, default=None,
 if __name__ == "__main__":
 
     args = parser.parse_args()
+    # 将开关传递给 mia.py（用环境变量最省事）
+    import os as _os
+    _os.environ["MIA_VERBOSE"] = "1" if args.mia_verbose else "0"
     # ---- 旧版 Legacy-Unlearn 总开关（默认关）----
     RUN_LEGACY_UNLEARN = False
     weights_path = os.path.abspath(os.path.join(args.exp_path, args.exp_name))
@@ -671,18 +677,19 @@ if __name__ == "__main__":
                                            shuffle=False, num_workers=args.num_workers)
             mia_eval_nonmem_loader   = _DL(_eval_nm_ds,    batch_size=test_dataloader.batch_size,
                                            shuffle=False, num_workers=args.num_workers)
-            # 诊断打印（可留可去）
-            try:
-                _s_idx = getattr(_shadow_nm_ds, "indices", None)
-                _e_idx = getattr(_eval_nm_ds, "indices", None)
-                _overlap = (set(_s_idx) & set(_e_idx)) if (_s_idx is not None and _e_idx is not None) else set()
-                print(f"[MIA-SPLIT] shadow_nonmem={_n_shadow_nonmem} eval_nonmem={_n_eval_nonmem} "
-                      f"shadow_id={id(_shadow_nm_ds)} eval_id={id(_eval_nm_ds)} overlap={len(_overlap)}")
-                if _s_idx is not None and _e_idx is not None:
-                    print(f"[MIA-SPLIT] shadow_head={list(_s_idx[:5])} ... tail={list(_s_idx[-5:])}")
-                    print(f"[MIA-SPLIT] eval__head={list(_e_idx[:5])} ... tail={list(_e_idx[-5:])}")
-            except Exception as _e:
-                print(f"[MIA-SPLIT][WARN] split diagnostics failed: {_e}")
+            # 诊断打印：仅在 --mia_verbose 时输出
+            if args.mia_verbose:
+                try:
+                    _s_idx = getattr(_shadow_nm_ds, "indices", None)
+                    _e_idx = getattr(_eval_nm_ds, "indices", None)
+                    _overlap = (set(_s_idx) & set(_e_idx)) if (_s_idx is not None and _e_idx is not None) else set()
+                    print(f"[MIA-SPLIT] shadow_nonmem={_n_shadow_nonmem} eval_nonmem={_n_eval_nonmem} "
+                          f"shadow_id={id(_shadow_nm_ds)} eval_id={id(_eval_nm_ds)} overlap={len(_overlap)}")
+                    if _s_idx is not None and _e_idx is not None:
+                        print(f"[MIA-SPLIT] shadow_head={list(_s_idx[:5])} ... tail={list(_s_idx[-5:])}")
+                        print(f"[MIA-SPLIT] eval__head={list(_e_idx[:5])} ... tail={list(_e_idx[-5:])}")
+                except Exception as _e:
+                    print(f"[MIA-SPLIT][WARN] split diagnostics failed: {_e}")
 
         # 2) 训练一次攻击器（基于 full-training shadow 模型）
         if attack_model is None:
@@ -752,19 +759,19 @@ if __name__ == "__main__":
         mia_shadow_nonmem_loader = _DL(_shadow_nm_ds, batch_size=test_dataloader.batch_size, shuffle=False, num_workers=args.num_workers)
         mia_eval_nonmem_loader   = _DL(_eval_nm_ds,    batch_size=test_dataloader.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    # —— 自检：两份 Subset 是否互斥、规模是否符合 —— 
-    try:
-        _s_idx = getattr(_shadow_nm_ds, "indices", None)
-        _e_idx = getattr(_eval_nm_ds, "indices", None)
-        _overlap = (set(_s_idx) & set(_e_idx)) if (_s_idx is not None and _e_idx is not None) else set()
-        print(f"[MIA-SPLIT] shadow_nonmem={_n_shadow_nonmem} eval_nonmem={_n_eval_nonmem} "
-              f"shadow_id={id(_shadow_nm_ds)} eval_id={id(_eval_nm_ds)} "
-              f"overlap={len(_overlap)}")
-        if _s_idx is not None and _e_idx is not None:
-            print(f"[MIA-SPLIT] shadow_head={list(_s_idx[:5])} ... tail={list(_s_idx[-5:])}")
-            print(f"[MIA-SPLIT] eval__head={list(_e_idx[:5])} ... tail={list(_e_idx[-5:])}")
-    except Exception as _e:
-        print(f"[MIA-SPLIT][WARN] split diagnostics failed: {_e}")
+    # —— 自检日志只在 --mia_verbose 时打印 —— 
+    if args.mia_verbose:
+        try:
+            _s_idx = getattr(_shadow_nm_ds, "indices", None)
+            _e_idx = getattr(_eval_nm_ds, "indices", None)
+            _overlap = (set(_s_idx) & set(_e_idx)) if (_s_idx is not None and _e_idx is not None) else set()
+            print(f"[MIA-SPLIT] shadow_nonmem={_n_shadow_nonmem} eval_nonmem={_n_eval_nonmem} "
+                  f"shadow_id={id(_shadow_nm_ds)} eval_id={id(_eval_nm_ds)} overlap={len(_overlap)}")
+            if _s_idx is not None and _e_idx is not None:
+                print(f"[MIA-SPLIT] shadow_head={list(_s_idx[:5])} ... tail={list(_s_idx[-5:])}")
+                print(f"[MIA-SPLIT] eval__head={list(_e_idx[:5])} ... tail={list(_e_idx[-5:])}")
+        except Exception as _e:
+            print(f"[MIA-SPLIT][WARN] split diagnostics failed: {_e}")
 
     # train mia attack model（使用“不与评估重叠”的非成员子集；若已存在则跳过）
     if args.apply_membership_inference and (locals().get("attack_model") is None):
@@ -1300,7 +1307,7 @@ if __name__ == "__main__":
             if args.fair_vue_debug:
                 print(f"[FV-DBG] used_rounds_for_target={used_rounds}, ||spec_total||_2={float(torch.norm(spec_total)):.3e}")
 
-             # 在“应用擦除（仅 parameters）”位置，用以下块替换原有几行：
+            # 在“应用擦除（仅 parameters）”位置，用以下块替换原有几行：
             # 应用擦除（仅 parameters）
             erase_scale = getattr(args, "fair_erase_scale", 0.25)
             param_now   = flatten_by_keys(start_sd, param_keys, device=dev)
@@ -1339,7 +1346,8 @@ if __name__ == "__main__":
 
             mia_fair = None
             if args.apply_membership_inference and args.mia_scope in ('fair_only','all'):
-                print("\n[调试] 开始执行成员推断攻击 (evaluate_mia_attack)...")
+                if args.mia_verbose:
+                    print("\n[调试] 开始执行成员推断攻击 (evaluate_mia_attack)...")
                 # 与其他分支保持一致：对目标客户端执行成员推断
                 mia_fair = evaluate_mia_attack(
                     target_model=deepcopy(fair_model),
@@ -1352,18 +1360,19 @@ if __name__ == "__main__":
                     eval_nonmem_loader=mia_eval_nonmem_loader
                     
                 )
-                print(f"[调试] MIA 返回类型: {type(mia_fair)}")
-                if isinstance(mia_fair, dict):
-                    print(f"[调试] MIA 字典键: {list(mia_fair.keys())[:10]}")  # 仅打印前10个键
-                    for k, v in list(mia_fair.items())[:5]:                   # 仅前5个键值
-                        if isinstance(v, (int, float, str)):
-                            print(f"  {k}: {v}")
-                        elif hasattr(v, 'shape'):
-                            print(f"  {k}: tensor/array shape={v.shape}")
-                        elif isinstance(v, (list, tuple)):
-                            print(f"  {k}: list length={len(v)}")
-                        else:
-                            print(f"  {k}: type={type(v)}")
+                if args.mia_verbose:
+                    print(f"[调试] MIA 返回类型: {type(mia_fair)}")
+                    if isinstance(mia_fair, dict):
+                        print(f"[调试] MIA 字典键: {list(mia_fair.keys())[:10]}")
+                        for k, v in list(mia_fair.items())[:5]:
+                            if isinstance(v, (int, float, str)):
+                                print(f"  {k}: {v}")
+                            elif hasattr(v, 'shape'):
+                                print(f"  {k}: tensor/array shape={v.shape}")
+                            elif isinstance(v, (list, tuple)):
+                                print(f"  {k}: list length={len(v)}")
+                            else:
+                                print(f"  {k}: type={type(v)}")
             print_forgetting_metrics(
                 method_name="FAIR-VUE",
                 test_acc=test_acc_fair,
