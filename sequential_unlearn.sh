@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================
 # FairVUE 参数搜索（去除日志写入，仅控制台输出）
-# 保持 --exp_name 不变
+# 每个客户端使用独立的 exp_name 和 retrain 路径
 # ============================================
 
 # 固定参数
@@ -16,17 +16,20 @@ EPOCHS=1
 SEED=42
 FULL_TRAIN_DIR="./experiments/cifar10_allcnn/full_training"
 DISTRIBUTION="dirichlet"
-EXP_NAME="cifar10_allcnn"
+BASE_EXP_NAME="cifar10_allcnn"
 
 # 超参数取值范围
-FAIR_RANK_LIST=(12)
+FAIR_RANK_LIST=(25)
 FAIR_TAU_MODES=("median")
-FAIR_FISHER_BATCHES=(5)
-FAIR_ERASE_SCALES=(0.26)
+FAIR_FISHER_BATCHES=(10)
+FAIR_ERASE_SCALES=(0 1)
 FORGET_CLIENTS=(5)
 
 # 循环执行实验
 for CID in "${FORGET_CLIENTS[@]}"; do
+  EXP_NAME="${BASE_EXP_NAME}_client${CID}"                           
+  RETRAIN_MODEL_PATH="./experiments/${EXP_NAME}/retraining"          
+  
   for RANK_K in "${FAIR_RANK_LIST[@]}"; do
     for TAU_MODE in "${FAIR_TAU_MODES[@]}"; do
       for FISHER_B in "${FAIR_FISHER_BATCHES[@]}"; do
@@ -36,7 +39,6 @@ for CID in "${FORGET_CLIENTS[@]}"; do
           echo "🚀 正在执行：client=${CID}, k=${RANK_K}, tau=${TAU_MODE}, fb=${FISHER_B}, es=${ERASE_S}"
           echo "=============================="
 
-          # 执行命令（不保存日志，仅输出到控制台）
           python3 main.py \
             --exp_name $EXP_NAME \
             --dataset $DATASET \
@@ -58,9 +60,12 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --fair_fisher_batches $FISHER_B \
             --fair_erase_scale $ERASE_S \
             --fair_vue_debug true \
-            --skip_retraining true \
             --skip_training true \
-            --full_training_dir $FULL_TRAIN_DIR
+            --skip_retraining true \
+            --full_training_dir $FULL_TRAIN_DIR \
+            --retraining_dir $RETRAIN_MODEL_PATH \
+            --apply_membership_inference true \
+
 
           echo "✅ 完成：client=${CID}, k=${RANK_K}, tau=${TAU_MODE}, fb=${FISHER_B}, es=${ERASE_S}"
           echo

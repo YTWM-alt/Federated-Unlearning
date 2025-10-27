@@ -93,7 +93,9 @@ token_*.txt
 打印文件夹结构.py
 批量试参结果.txt
 客户端遗忘评估指标.pdf
+数据记录.txt
 /实验报告
+/special_experiments
 # --- 本地测试脚本 ---
 dempanding_test.py
 fair_vue_demo.py

@@ -296,7 +296,7 @@ parser.add_argument('--fair_fisher_batches', type=int, default=5, help='Fisher�
 parser.add_argument('--fair_vue_debug', type=str2bool, default=False,
                     help='是否打印 FAIR-VUE 调试信息（True/False）')
 parser.add_argument('--fair_erase_scale', type=float, default=0.25,
-                    help='特异分量擦除强度 (0,1]，默认0.25，建议先小后大')
+                    help='特异分量擦除强度 (0,1]，默认0.25，建议先小后大')         
 parser.add_argument('--skip_retraining', type=str2bool, default=False,
                     help='是否跳过重训练阶段（True/False）')
 
@@ -649,16 +649,131 @@ if __name__ == "__main__":
         forget_loader = clientwise_dataloaders[forget_client]
         acc = get_accuracy_only(global_model, forget_loader, args.device)
         print(f"[Training模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
-    # -------------------------------------------------------
-    # train mia attack model
+
+    # === [MIA-INIT] 在任何 evaluate_mia_attack 调用之前，先准备好分割与攻击器 ===
+    # 幂等：若后面已有同名对象，这里不会重复构造
+    attack_model = locals().get("attack_model", None)
+    mia_shadow_nonmem_loader = locals().get("mia_shadow_nonmem_loader", None)
+    mia_eval_nonmem_loader   = locals().get("mia_eval_nonmem_loader", None)
+
     if args.apply_membership_inference:
+        # 1) 准备“互斥”的非成员集（shadow/eval）
+        if mia_eval_nonmem_loader is None or mia_shadow_nonmem_loader is None:
+            from torch.utils.data import random_split, DataLoader as _DL
+            _n_test = len(test_dataloader.dataset)
+            _n_shadow_nonmem = int(0.8 * _n_test)
+            _n_eval_nonmem   = _n_test - _n_shadow_nonmem
+            _gen = torch.Generator().manual_seed(args.seed if getattr(args, "seed", None) is not None else 0)
+            _shadow_nm_ds, _eval_nm_ds = random_split(
+                test_dataloader.dataset, [_n_shadow_nonmem, _n_eval_nonmem], generator=_gen
+            )
+            mia_shadow_nonmem_loader = _DL(_shadow_nm_ds, batch_size=test_dataloader.batch_size,
+                                           shuffle=False, num_workers=args.num_workers)
+            mia_eval_nonmem_loader   = _DL(_eval_nm_ds,    batch_size=test_dataloader.batch_size,
+                                           shuffle=False, num_workers=args.num_workers)
+            # 诊断打印（可留可去）
+            try:
+                _s_idx = getattr(_shadow_nm_ds, "indices", None)
+                _e_idx = getattr(_eval_nm_ds, "indices", None)
+                _overlap = (set(_s_idx) & set(_e_idx)) if (_s_idx is not None and _e_idx is not None) else set()
+                print(f"[MIA-SPLIT] shadow_nonmem={_n_shadow_nonmem} eval_nonmem={_n_eval_nonmem} "
+                      f"shadow_id={id(_shadow_nm_ds)} eval_id={id(_eval_nm_ds)} overlap={len(_overlap)}")
+                if _s_idx is not None and _e_idx is not None:
+                    print(f"[MIA-SPLIT] shadow_head={list(_s_idx[:5])} ... tail={list(_s_idx[-5:])}")
+                    print(f"[MIA-SPLIT] eval__head={list(_e_idx[:5])} ... tail={list(_e_idx[-5:])}")
+            except Exception as _e:
+                print(f"[MIA-SPLIT][WARN] split diagnostics failed: {_e}")
+
+        # 2) 训练一次攻击器（基于 full-training shadow 模型）
+        if attack_model is None:
+            shadow_model = deepcopy(global_model)
+            attack_model = train_attack_model(
+                shadow_global_model=shadow_model,
+                shadow_client_loaders=clientwise_dataloaders,
+                shadow_test_loader=mia_shadow_nonmem_loader,
+                dataset=args.dataset, device=args.device)
+
+
+    # ==== 六项指标统一打印（Training 基线）+ MIA：只要 --apply_membership_inference 就默认跑 ====
+    mia_training = None
+    if args.apply_membership_inference:
+        # 在“训练好的完整模型”上执行成员推断（评估集非成员与 shadow 非成员互斥）
+        mia_training = evaluate_mia_attack(
+            target_model=deepcopy(global_model),
+            attack_model=attack_model,
+            client_loaders=clientwise_dataloaders,
+            test_loader=test_dataloader,
+            dataset=args.dataset,
+            forget_client_idx=forget_client,
+            device=args.device,
+            eval_nonmem_loader=mia_eval_nonmem_loader
+        )
+
+    # 统一六个指标：测试集准确率、遗忘客户端准确率、遗忘客户端交叉熵、加速比(Training 无)、参数夹角(Training 无)、MIA（三元组）
+    _forget_loader = clientwise_dataloaders[forget_client]
+    test_acc_tr    = get_accuracy_only(global_model, test_dataloader, args.device)
+    target_acc_tr  = get_accuracy_only(global_model, _forget_loader, args.device)
+    target_loss_tr = eval_ce_loss(global_model, _forget_loader, args.device)
+    speedup_tr     = None   # 以 retrain 为基线，此处不计
+    angle_tr       = None   # 需相对 retrain 的夹角，这里留空
+    print_forgetting_metrics(
+        method_name="Training",
+        test_acc=test_acc_tr,
+        target_acc=target_acc_tr,
+        target_loss=target_loss_tr,
+        speedup_x=speedup_tr,
+        angle_deg=angle_tr,
+        mia_result=mia_training
+    )
+    # 清理 MIA 大对象与 CUDA 缓存，避免后续卡住
+    try:
+        import torch, gc
+        if isinstance(mia_training, dict):
+            for k in ['mia_attacker_predictions','mia_attacker_probabilities','predictions','probabilities','scores']:
+                mia_training.pop(k, None)
+        if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+            torch.cuda.synchronize(); torch.cuda.empty_cache()
+        gc.collect()
+    except Exception:
+        pass
+
+
+
+    # -------------------------------------------------------
+    # === MIA: 准备“互斥”的非成员数据（避免泄漏）【若前面已构造，这里跳过】===
+    from torch.utils.data import random_split, DataLoader as _DL
+    if args.apply_membership_inference and (locals().get("mia_eval_nonmem_loader") is None
+                                            or locals().get("mia_shadow_nonmem_loader") is None):
+        _n_test = len(test_dataloader.dataset)
+        _n_shadow_nonmem = int(0.8 * _n_test)
+        _n_eval_nonmem   = _n_test - _n_shadow_nonmem
+        _gen = torch.Generator().manual_seed(args.seed if hasattr(args, "seed") else 0)
+        _shadow_nm_ds, _eval_nm_ds = random_split(test_dataloader.dataset, [_n_shadow_nonmem, _n_eval_nonmem], generator=_gen)
+        mia_shadow_nonmem_loader = _DL(_shadow_nm_ds, batch_size=test_dataloader.batch_size, shuffle=False, num_workers=args.num_workers)
+        mia_eval_nonmem_loader   = _DL(_eval_nm_ds,    batch_size=test_dataloader.batch_size, shuffle=False, num_workers=args.num_workers)
+
+    # —— 自检：两份 Subset 是否互斥、规模是否符合 —— 
+    try:
+        _s_idx = getattr(_shadow_nm_ds, "indices", None)
+        _e_idx = getattr(_eval_nm_ds, "indices", None)
+        _overlap = (set(_s_idx) & set(_e_idx)) if (_s_idx is not None and _e_idx is not None) else set()
+        print(f"[MIA-SPLIT] shadow_nonmem={_n_shadow_nonmem} eval_nonmem={_n_eval_nonmem} "
+              f"shadow_id={id(_shadow_nm_ds)} eval_id={id(_eval_nm_ds)} "
+              f"overlap={len(_overlap)}")
+        if _s_idx is not None and _e_idx is not None:
+            print(f"[MIA-SPLIT] shadow_head={list(_s_idx[:5])} ... tail={list(_s_idx[-5:])}")
+            print(f"[MIA-SPLIT] eval__head={list(_e_idx[:5])} ... tail={list(_e_idx[-5:])}")
+    except Exception as _e:
+        print(f"[MIA-SPLIT][WARN] split diagnostics failed: {_e}")
+
+    # train mia attack model（使用“不与评估重叠”的非成员子集；若已存在则跳过）
+    if args.apply_membership_inference and (locals().get("attack_model") is None):
         shadow_model = deepcopy(global_model)
-        # attack_model = XGBClassifier()
-        attack_model = train_attack_model(shadow_global_model=shadow_model,
-                                          shadow_client_loaders=clientwise_dataloaders,
-                                          shadow_test_loader=test_dataloader,
-                                          dataset=args.dataset,
-                                          device=args.device)
+        attack_model = train_attack_model(
+            shadow_global_model=shadow_model,
+            shadow_client_loaders=clientwise_dataloaders,
+            shadow_test_loader=mia_shadow_nonmem_loader,
+            dataset=args.dataset, device=args.device)
     # ---------------------------------------------------------
     # evaluate attack accuracy
     if args.apply_backdoor:
@@ -753,6 +868,38 @@ if __name__ == "__main__":
             acc = get_accuracy_only(retrained_global_model, forget_loader, args.device)
             print(f"[Retrain模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
 
+
+        # ==== 统一打印（Retrain Baseline）+ MIA：只要开启 MIA 就默认跑 ====
+        mia_retrain = None
+        if args.apply_membership_inference:
+            mia_retrain = evaluate_mia_attack(
+                target_model=deepcopy(retrained_global_model),
+                attack_model=attack_model,
+                client_loaders=clientwise_dataloaders,
+                test_loader=test_dataloader,
+                dataset=args.dataset,
+                forget_client_idx=forget_client,
+                device=args.device,
+                eval_nonmem_loader=mia_eval_nonmem_loader
+            )
+        test_acc_rt    = get_accuracy_only(retrained_global_model, test_dataloader, args.device)
+        target_acc_rt  = get_accuracy_only(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
+        target_loss_rt = eval_ce_loss(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
+        speedup_rt     = 1.0  # retrain 作为基线
+        angle_rt       = 0.0
+        print_forgetting_metrics("Retrain", test_acc_rt, target_acc_rt, target_loss_rt, speedup_rt, angle_rt, mia_retrain)
+        # 清理大对象
+        try:
+            import torch, gc
+            if isinstance(mia_retrain, dict):
+                for k in ['mia_attacker_predictions','mia_attacker_probabilities','predictions','probabilities','scores']:
+                    mia_retrain.pop(k, None)
+            if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+                torch.cuda.synchronize(); torch.cuda.empty_cache()
+            gc.collect()
+        except Exception:
+            pass
+
     else:
         # 跳过重训：若用户提供了 retraining_dir / retrained_ckpt，则直接载入基线权重
         import os, torch
@@ -797,6 +944,38 @@ if __name__ == "__main__":
             forget_loader = clientwise_dataloaders[forget_client]
             acc = get_accuracy_only(retrained_global_model, forget_loader, args.device)
             print(f"[Retrain(loaded)模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
+
+
+            # ==== 统一打印（Retrain Baseline，Loaded）+ MIA：只要开启 MIA 就默认跑 ====
+            mia_retrain = None
+            if args.apply_membership_inference:
+                mia_retrain = evaluate_mia_attack(
+                    target_model=deepcopy(retrained_global_model),
+                    attack_model=attack_model,
+                    client_loaders=clientwise_dataloaders,
+                    test_loader=test_dataloader,
+                    dataset=args.dataset,
+                    forget_client_idx=forget_client,
+                    device=args.device,
+                    eval_nonmem_loader=mia_eval_nonmem_loader
+                )
+            test_acc_rt    = get_accuracy_only(retrained_global_model, test_dataloader, args.device)
+            target_acc_rt  = get_accuracy_only(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
+            target_loss_rt = eval_ce_loss(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
+            speedup_rt     = None   # 此分支没计时，就打印 NA
+            angle_rt       = 0.0
+            print_forgetting_metrics("Retrain", test_acc_rt, target_acc_rt, target_loss_rt, speedup_rt, angle_rt, mia_retrain)
+            try:
+                import torch, gc
+                if isinstance(mia_retrain, dict):
+                    for k in ['mia_attacker_predictions','mia_attacker_probabilities','predictions','probabilities','scores']:
+                        mia_retrain.pop(k, None)
+                if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+                    torch.cuda.synchronize(); torch.cuda.empty_cache()
+                gc.collect()
+            except Exception:
+                pass
+
         else:
             if args.verbose:
                 print("[Skip] 跳过重训练基线（--skip_retraining），且未提供 --retraining_dir / --retrained_ckpt")     
@@ -949,7 +1128,8 @@ if __name__ == "__main__":
                     test_loader=test_dataloader,
                     dataset=args.dataset,
                     forget_client_idx=args.forget_clients[0],
-                    device=args.device
+                    device=args.device,
+                    eval_nonmem_loader=mia_eval_nonmem_loader
                 )
             print_forgetting_metrics("FedEraser", test_acc_fe, target_acc_fe, target_loss_fe, speedup_fe, angle_fe, mia_fe)
         elif baseline == 'fair_vue':
@@ -966,8 +1146,9 @@ if __name__ == "__main__":
             )
 
             # 1) 按轮读取所有客户端逐轮增量 Δ_{cid}^{(r)}
-            train_path = os.path.abspath(os.path.join(weights_path, "full_training"))
-            round_client_deltas = _build_round_deltas(train_path, args.total_num_clients)
+            # 尊重 --skip_training 时传入的 --full_training_dir；否则沿用上文解析出的 train_path
+            fv_train_path = os.path.abspath(args.full_training_dir) if args.full_training_dir else os.path.abspath(train_path)
+            round_client_deltas = _build_round_deltas(fv_train_path, args.total_num_clients)
 
             # === 插入点 A：刚刚构造完 round_client_deltas 之后 ===
             if args.fair_vue_debug:
@@ -986,7 +1167,7 @@ if __name__ == "__main__":
                     print(f"[FV-DBG] round={r} mean||Δ||={mean(ns):.3e} (n={len(ns)})")
 
             if len(round_client_deltas) == 0:
-                raise RuntimeError(f"[FAIR-VUE] 没有从 {train_path} 解析到逐轮的 client 权重，无法构造增量。")
+                raise RuntimeError(f"[FAIR-VUE] 没有从 {fv_train_path} 解析到逐轮的 client 权重，无法构造增量。")
 
             # 2) 目标客户端历史：拼成列表用于SVD；其它客户端的增量合起来用于ρ
             target_id = args.forget_clients[0]
@@ -1119,6 +1300,7 @@ if __name__ == "__main__":
             if args.fair_vue_debug:
                 print(f"[FV-DBG] used_rounds_for_target={used_rounds}, ||spec_total||_2={float(torch.norm(spec_total)):.3e}")
 
+             # 在“应用擦除（仅 parameters）”位置，用以下块替换原有几行：
             # 应用擦除（仅 parameters）
             erase_scale = getattr(args, "fair_erase_scale", 0.25)
             param_now   = flatten_by_keys(start_sd, param_keys, device=dev)
@@ -1166,7 +1348,9 @@ if __name__ == "__main__":
                     test_loader=test_dataloader,
                     dataset=args.dataset,
                     forget_client_idx=args.forget_clients[0],
-                    device=args.device
+                    device=args.device,
+                    eval_nonmem_loader=mia_eval_nonmem_loader
+                    
                 )
                 print(f"[调试] MIA 返回类型: {type(mia_fair)}")
                 if isinstance(mia_fair, dict):
@@ -1380,7 +1564,8 @@ if __name__ == "__main__":
                                                      test_loader=test_dataloader,
                                                      dataset=args.dataset,
                                                      forget_client_idx=args.forget_clients[0],
-                                                     device=args.device)
+                                                     device=args.device,
+                                                     eval_nonmem_loader=mia_eval_nonmem_loader)
                 print(f"[MIA] PGA 完成，用时 {(_t.time()-_t0):.2f}s")
                 summary['mia_attack']['after_pga'] = _shrink_mia_result(pga_mia_result)
                 _sync_cuda()
