@@ -33,7 +33,10 @@ from FedUnlearner.baselines.fair_vue.healing import weight_interpolate_heal
 from FedUnlearner.baselines.fair_vue.fisher import empirical_fisher_diagonal
 from FedUnlearner.baselines.fair_vue.subspace import (
     weighted_matrix_from_deltas, topk_right_singular_vectors,
-    rho_values, split_subspaces, flatten_state_dict, state_dict_like
+    rho_values, split_subspaces, flatten_state_dict, state_dict_like,
+    # 仅参数键的版本：避免包含 buffer 造成维度不匹配
+    flatten_by_keys, state_dict_like_by_keys,
+    weighted_matrix_from_deltas_keys, rho_values_keys
 )
 from FedUnlearner.baselines.fair_vue.projection import projection_matrix
 
@@ -297,6 +300,26 @@ parser.add_argument('--fair_vue_debug', type=str2bool, default=False,
                     help='是否打印 FAIR-VUE 调试信息（True/False）')
 parser.add_argument('--fair_erase_scale', type=float, default=0.25,
                     help='特异分量擦除强度 (0,1]，默认0.25，建议先小后大')
+parser.add_argument('--fair_auto_erase', type=str2bool, default=True,
+                    help='自动调参 erase_scale 以拟合重训练（默认开启）')
+parser.add_argument('--fair_auto_tune_all', type=str2bool, default=True,
+                    help='联合自动调参 Fisher批次 / rank_k / tau_mode（默认开启）')
+parser.add_argument('--fair_fisher_grid', type=str, default='1,2,5,10',
+                    help='Fisher 批次数候选（逗号分隔），用于稳定性搜索')
+parser.add_argument('--fair_fisher_stability', type=float, default=0.98,
+                    help='Fisher 对角稳定阈值（与更大批次数的余弦相似度阈值）')
+parser.add_argument('--fair_rank_energy', type=float, default=0.90,
+                    help='选取 fair_rank_k 的累计奇异值能量阈值（默认 90%）')
+parser.add_argument('--fair_rank_k_min', type=int, default=4, help='rank_k 下界')
+parser.add_argument('--fair_rank_k_max', type=int, default=64, help='rank_k 上界')
+parser.add_argument('--fair_tau_metric', type=str, default='stdgap', choices=['stdgap','gap'],
+                    help='τ 选择的分离度指标：stdgap=(均值差/总体std)，gap=上下组均值差')
+parser.add_argument('--fair_drop_bounds', type=str, default='0.00,0.04',
+                    help='期望全局精度下降区间，形如 "min,max"（默认 0~4%）')
+parser.add_argument('--fair_grid_scales', type=str, default='0.5,0.75,1.0,1.25,1.5',
+                    help='粗网格倍数（相对 fair_erase_scale）')
+parser.add_argument('--fair_bisect_steps', type=int, default=3,
+                    help='命中区间后的二分细化步数')
 parser.add_argument('--skip_retraining', type=str2bool, default=False,
                     help='是否跳过重训练阶段（True/False）')
 
@@ -743,6 +766,8 @@ if __name__ == "__main__":
         gc.collect()
     except Exception:
         pass
+
+    # （删除：这里不再做三参自动调参，改到 fair_vue 分支内“按轮增量解析后”执行）
 
 
 
@@ -1196,6 +1221,86 @@ if __name__ == "__main__":
                 print(f"[FV-DBG] target_id={target_id}, T=len(target_deltas_list)={len(target_deltas_list)}, "
                     f"M=len(other_deltas_list)={len(other_deltas_list)}")
 
+            # ==========================================================
+            # === FAIR-VUE 预自动调参（三项）：b/k/τ（不访问原始样本） ===
+            #    放到 FAIR-VUE 分支内，就近使用 fv_train_path/target_* 列表
+            # ==========================================================
+            if args.fair_auto_tune_all:
+                if args.fair_vue_debug:
+                    print("[FV-AUTO] ==== Start auto-tuning {fisher_batches, rank_k, tau_mode} ====")
+
+                # —— 仅参数键，保证与 Fisher 的键一致
+                param_keys = [name for (name, _p) in fair_model.named_parameters()]
+
+                # ——（1）Fisher 批次数：稳定性（与 ≥2b 对比的余弦相似度）
+                def _parse_list_csv(s: str):
+                    return [int(x) for x in str(s).split(',') if str(x).strip()!='']
+                fisher_grid = sorted(set([b for b in (_parse_list_csv(args.fair_fisher_grid) or [1,2,5,10]) if b>0]))
+                stability = float(args.fair_fisher_stability)
+                def _flatten_fi(Fi: dict):
+                    import torch
+                    return torch.cat([Fi[k].detach().flatten().float().cpu() for k in param_keys if k in Fi])
+                def _cos(a,b):
+                    import torch
+                    na, nb = torch.norm(a), torch.norm(b)
+                    if na.item()==0 or nb.item()==0: return 0.0
+                    return float(torch.clamp(torch.dot(a,b)/(na*nb), -1.0, 1.0).item())
+                chosen_b = fisher_grid[-1]
+                chosen_fisher = None
+                for b in fisher_grid:
+                    b2 = next((c for c in fisher_grid if c >= 2*b), fisher_grid[-1])
+                    Fi_b  = client_endpoints[target_id].compute_fisher(fair_model.state_dict(), device=args.device, max_batches=b)
+                    Fi_b2 = client_endpoints[target_id].compute_fisher(fair_model.state_dict(), device=args.device, max_batches=b2)
+                    sim = _cos(_flatten_fi(Fi_b), _flatten_fi(Fi_b2))
+                    if args.fair_vue_debug:
+                        print(f"[FV-AUTO][Fisher] b={b} vs b'={b2} → cos={sim:.4f}")
+                    if sim >= stability:
+                        chosen_b = b
+                        chosen_fisher = Fi_b2
+                        break
+                if chosen_fisher is None:
+                    chosen_fisher = client_endpoints[target_id].compute_fisher(fair_model.state_dict(), device=args.device, max_batches=chosen_b)
+                args.fair_fisher_batches = int(chosen_b)
+                if args.fair_vue_debug:
+                    print(f"[FV-AUTO][Fisher] chosen_b={args.fair_fisher_batches}")
+
+                # ——（2）rank_k：Fisher 加权的 Δ_target 历史矩阵的 SVD 累计能量阈值
+                if len(target_deltas_list) >= 1:
+                    import torch
+                    Xw = weighted_matrix_from_deltas_keys(target_deltas_list, chosen_fisher, param_keys, device=args.device)
+                    Xc = Xw - Xw.mean(dim=0, keepdim=True)
+                    U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
+                    energy = (S**2); cum = torch.cumsum(energy, dim=0); total = torch.sum(energy) + 1e-12
+                    thr = float(args.fair_rank_energy)
+                    k_auto = int(torch.searchsorted(cum/total, torch.tensor(thr, device=cum.device)).item() + 1)
+                    k_auto = max(int(args.fair_rank_k_min), min(int(args.fair_rank_k_max), k_auto))
+                    args.fair_rank_k = int(k_auto)
+                    if args.fair_vue_debug:
+                        print(f"[FV-AUTO][rank_k] energy_thr={thr:.2f} → k={args.fair_rank_k} (min={args.fair_rank_k_min}, max={args.fair_rank_k_max})")
+
+                # ——（3）tau_mode：用其它客户端在最后一轮的 Δ 计算 ρ 分布分离度
+                if len(other_deltas_list) >= 1 and len(target_deltas_list) >= 1:
+                    # 用同一 V_k（与上面 Xw 一致）
+                    Xc_for_V = Xw - Xw.mean(dim=0, keepdim=True)
+                    _U, _S, Vh_full = torch.linalg.svd(Xc_for_V, full_matrices=False)
+                    V_k = Vh_full.T[:, :int(args.fair_rank_k)]
+                    def _rho_sep(tau_mode: str):
+                        import numpy as np
+                        rhos = rho_values_keys(V_k, [d for d in other_deltas_list if isinstance(d, dict)], param_keys)
+                        if len(rhos)==0: return 0.0
+                        r = np.asarray(rhos, dtype=float)
+                        tau = np.median(r) if tau_mode=='median' else float(r.mean())
+                        lower, upper = r[r<tau], r[r>=tau]
+                        if len(lower)==0 or len(upper)==0: return 0.0
+                        gap = float(upper.mean() - lower.mean())
+                        return gap if args.fair_tau_metric=='gap' else gap / float(r.std()+1e-12)
+                    s_med, s_mean = _rho_sep('median'), _rho_sep('mean')
+                    args.fair_tau_mode = 'median' if s_med >= s_mean else 'mean'
+                    if args.fair_vue_debug:
+                        print(f"[FV-AUTO][tau] sep(median)={s_med:.4f}, sep(mean)={s_mean:.4f} → choose {args.fair_tau_mode}")
+            # =================== 三参自动调参结束 ====================
+
+
             # 3) Fisher（遗忘指令下发 → 目标客户端本地计算 → 仅上传 Fisher 对角）
             #    与 pipeline 保持一致：为 Fisher 批次固定随机性，避免抽样差异带来系统性偏移
             import random, numpy as np, torch
@@ -1307,9 +1412,121 @@ if __name__ == "__main__":
             if args.fair_vue_debug:
                 print(f"[FV-DBG] used_rounds_for_target={used_rounds}, ||spec_total||_2={float(torch.norm(spec_total)):.3e}")
 
-            # 在“应用擦除（仅 parameters）”位置，用以下块替换原有几行：
-            # 应用擦除（仅 parameters）
-            erase_scale = getattr(args, "fair_erase_scale", 0.25)
+            # === 自动调参 erase_scale（仅 parameters；不访问原始数据）===
+            # 1) 解析参数
+            def _parse_pair_csv(s: str):
+                xs = [float(x) for x in s.split(',') if x.strip()!='']
+                if len(xs) < 2:
+                    return 0.0, 0.04
+                return xs[0], xs[1]
+            def _parse_list_csv(s: str):
+                return [float(x) for x in s.split(',') if x.strip()!='']
+            target_lo, target_hi = _parse_pair_csv(getattr(args, "fair_drop_bounds", "0.00,0.04"))
+            grid_mults = _parse_list_csv(getattr(args, "fair_grid_scales", "0.5,0.75,1.0,1.25,1.5"))
+            bisect_steps = int(getattr(args, "fair_bisect_steps", 3))
+
+            # 2) 诊断量：Fisher 能量 & 特异性分
+            def _fisher_energy(vec_1d: torch.Tensor) -> float:
+                like = state_dict_like_by_keys(vec_1d.to('cpu'), start_sd, param_keys)
+                s = 0.0
+                for k in param_keys:
+                    Fi = fisher.get(k, None)
+                    if Fi is None:
+                        continue
+                    v = like[k].to(Fi.device).float()
+                    s += float((Fi.float().flatten() * (v.flatten()**2)).sum().item())
+                return s
+            spec_energy = _fisher_energy(spec_total)
+            def _safe_cos(a: torch.Tensor, b: torch.Tensor) -> float:
+                na = torch.norm(a); nb = torch.norm(b)
+                if na.item()==0 or nb.item()==0:
+                    return 0.0
+                return float(torch.dot(a, b) / (na*nb))
+            with torch.no_grad():
+                unit_spec = spec_total / (torch.norm(spec_total) + 1e-12)
+                cos_list = []
+                # 采样最多 256 个“其它客户端增量”估计平均相似度，避免过慢
+                take = other_deltas_list[:256]
+                for d in take:
+                    v = flatten_by_keys(d, param_keys, device=dev)
+                    cos_list.append(_safe_cos(unit_spec, v))
+                avg_cos = sum(cos_list)/max(1, len(cos_list))
+                idio = max(0.0, min(1.0, 1.0 - avg_cos))  # 特异性分：越大越“特”
+            if args.fair_vue_debug:
+                print(f"[FV-DBG] spec_fisher_energy={spec_energy:.3e}, avg_cos={avg_cos:.3f}, idiosyncrasy={idio:.3f}")
+
+            # 3) 基线精度（未擦除）：**与 _eval_acc 用同一路径**，避免参照不一致
+            baseline_acc = None
+
+            # 4) 构造候选 α：围绕用户设定的 base_alpha 做粗网格 + 特异性修正点
+            base_alpha = float(getattr(args, 'fair_erase_scale', 0.25))
+            alpha0 = base_alpha * (0.7 + 0.6*idio)  # 0.7~1.3×，随特异性调整
+            cands = sorted(set([0.0] + [max(0.0, m*base_alpha) for m in grid_mults] + [alpha0]))
+
+            # 评估函数：临时应用 α·spec_total 到参数并测一次测试集精度（不改动原模型）
+            def _eval_acc(alpha: float) -> float:
+                param_now = flatten_by_keys(start_sd, param_keys, device=dev)
+                param_new = param_now - float(alpha) * spec_total
+                new_params = state_dict_like_by_keys(param_new.to('cpu'), start_sd, param_keys)
+                tmp_sd = dict(start_sd)
+                for k in param_keys:
+                    tmp_sd[k] = new_params[k]
+                tmp_model = deepcopy(fair_model).to(args.device)
+                tmp_model.load_state_dict(tmp_sd)
+                acc = float(get_accuracy_only(tmp_model, test_dataloader, args.device))
+                del tmp_model
+                return acc
+
+            # 用同一条评估链路测 baseline，确保 drop(0)==0
+            baseline_acc = _eval_acc(0.0)
+
+            # 5) 粗网格搜索
+            evals = [(a, _eval_acc(a)) for a in cands]
+            drops = [(a, max(0.0, baseline_acc - acc)) for (a, acc) in evals]
+            under = max([a for a, d in drops if d <= target_lo + 1e-6], default=None)
+            over  = min([a for a, d in drops if d >= target_hi - 1e-6], default=None)
+ 
+
+            if under is None and over is None:
+                # 没覆盖目标区间：选距离区间中点最近的 α
+                mid = 0.5*(target_lo + target_hi)
+                chosen = min(drops, key=lambda t: abs(t[1]-mid))[0]
+            else:
+                # 6) 二分细化到 [target_lo, target_hi] 内
+                #    若最小候选就超标（under=None 且 over存在且 over==min(cands)），强制从 [0.0, over] 开始搜
+                lo = under if under is not None else 0.0
+                hi = over  if over  is not None else max(cands)
+                if args.fair_vue_debug:
+                    print(f"[FV-DBG] bracket init: lo={lo:.4f}, hi={hi:.4f}")
+                chosen = None
+                for _ in range(max(0, bisect_steps)):
+                    mid_a = 0.5*(lo + hi)
+                    acc_m = _eval_acc(mid_a)
+                    drop_m = max(0.0, baseline_acc - acc_m)
+                    if args.fair_vue_debug:
+                        print(f"[FV-DBG] bisect α={mid_a:.4f} → drop={drop_m:.4f}")
+                    if drop_m < target_lo:
+                        lo = mid_a
+                    elif drop_m > target_hi:
+                        hi = mid_a
+                    else:
+                        chosen = mid_a
+                        break
+                if chosen is None:
+                    # 仍未命中：在端点 lo/hi 中择一使下降更接近区间
+                    def _dist_to_interval(x, L, H): return 0.0 if L<=x<=H else min(abs(x-L), abs(x-H))
+                    acc_lo = _eval_acc(lo); acc_hi = _eval_acc(hi)
+                    drop_lo = max(0.0, baseline_acc - acc_lo)
+                    drop_hi = max(0.0, baseline_acc - acc_hi)
+                    chosen = lo if _dist_to_interval(drop_lo, target_lo, target_hi) <= _dist_to_interval(drop_hi, target_lo, target_hi) else hi
+                if args.fair_vue_debug:
+                    print(f"[FV-DBG] bracket final: lo→{lo:.4f}, hi→{hi:.4f}, chosen={chosen:.4f}")
+
+            erase_scale = float(chosen if getattr(args, 'fair_auto_erase', True) else base_alpha)
+            if args.fair_vue_debug:
+                print(f"[FV-DBG] erase_scale(chosen)={erase_scale:.4f} (base={base_alpha:.4f}, bounds=[{target_lo:.3f},{target_hi:.3f}])")
+
+            # 7) 应用最终擦除到模型参数
             param_now   = flatten_by_keys(start_sd, param_keys, device=dev)
             param_new   = param_now - erase_scale * spec_total
             new_params  = state_dict_like_by_keys(param_new.to('cpu'), start_sd, param_keys)
