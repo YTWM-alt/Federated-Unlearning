@@ -5,18 +5,18 @@
 # ============================================
 
 # 固定参数
-DATASET="cifar10"
-MODEL="allcnn"
+DATASET="cifar100"
+MODEL="resnet18"
 OPTIMIZER="sgd"
-TOTAL_CLIENTS=10
-ITERS=40
+TOTAL_CLIENTS=20
+ITERS=200
 DEVICE="cuda"
-LR=0.03
+LR=0.01
 EPOCHS=1
 SEED=42
-FULL_TRAIN_DIR="./experiments/cifar10_allcnn/full_training"
+FULL_TRAIN_DIR="./experiments/cifar100_resnet18/full_training"
 DISTRIBUTION="dirichlet"
-BASE_EXP_NAME="cifar10_allcnn"
+BASE_EXP_NAME="cifar100_resnet18"
 
 # 超参数取值范围
 FAIR_RANK_LIST=(25)
@@ -60,8 +60,8 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --fair_fisher_batches $FISHER_B \
             --fair_erase_scale $ERASE_S \
             --fair_vue_debug true \
-            --skip_training true \
-            --skip_retraining true \
+            --skip_training false \
+            --skip_retraining false \
             --full_training_dir $FULL_TRAIN_DIR \
             --retraining_dir $RETRAIN_MODEL_PATH \
             --apply_membership_inference true \

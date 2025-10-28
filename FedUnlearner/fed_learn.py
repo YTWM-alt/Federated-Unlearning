@@ -97,7 +97,7 @@ def fed_train(num_training_iterations: int, test_dataloader: torch.utils.data.Da
         print(f"Test Accuracy for global model : {test_acc_global*100}, Loss : {test_loss_global}")
 
         # 早停机制（双条件：达到目标或长时间未提升）
-        target_acc = 0.80  # 提前停止的目标精度
+        target_acc = 1  # 提前停止的目标精度
         if test_acc_global >= target_acc:
             print(f"Early stopping: accuracy {test_acc_global*100:.2f}% reached target {target_acc*100:.0f}%")
             break

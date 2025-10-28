@@ -270,14 +270,14 @@ parser.add_argument('--model', type=str, default='allcnn', choices=["allcnn", 'r
 parser.add_argument('--pretrained', type=bool,
                     default=False, help='use pretrained model')
 
-parser.add_argument('--dataset', type=str, default='cifar10', choices=["mnist", "cifar10"],
+parser.add_argument('--dataset', type=str, default='cifar10', choices=["mnist", "cifar10", "cifar100"],
                     help='dataset name')
 parser.add_argument('--optimizer', type=str, default='adam', choices=["sgd", "adam"],
                     help='optimizer name')
-parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
+parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
 parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
 parser.add_argument('--weight_decay', type=float,
-                    default=0.0001, help='weight decay')
+                    default=5e-4, help='weight decay')
 parser.add_argument('--batch_size', type=int, default=128, help='batch size')
 parser.add_argument('--num_local_epochs', type=int,
                     default=1, help='number of local epochs')
@@ -480,7 +480,7 @@ if __name__ == "__main__":
 
     if args.client_data_distribution == 'dirichlet':
         clientwise_dataset = create_dirichlet_data_distribution(train_dataset,
-                                                                num_clients=args.total_num_clients, num_classes=num_classes, alpha=0.5)
+                                                                num_clients=args.total_num_clients, num_classes=num_classes, alpha=0.3)
     elif args.client_data_distribution == 'iid':
         clientwise_dataset = create_iid_data_distribution(train_dataset, num_clients=args.total_num_clients,
                                                           num_classes=num_classes)
