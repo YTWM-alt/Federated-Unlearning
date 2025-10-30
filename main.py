@@ -11,6 +11,7 @@ import sys
 from datetime import datetime
 import re
 import io
+import gc
 
 
 from FedUnlearner.utils import (
@@ -210,6 +211,52 @@ def _build_round_deltas(train_path: str, total_clients: int):
             round_client_deltas[r_cur] = deltas_this_round
     return round_client_deltas
 
+def _iter_round_deltas_stream(train_path: str, total_clients: int):
+    """
+    逐轮产生 {cid -> Δ_i^t}，避免一次性攒全量到内存。
+    Δ_i^t = client_{i,t} - mean_clients_{t-1}
+    内部采用“边累加边求均值”的方式构造 g_prev，减少临时峰值。
+    """
+    rounds = _list_iteration_dirs(train_path)
+    for r_idx in range(1, len(rounds)):
+        r_prev, dir_prev = rounds[r_idx-1]
+        r_cur,  dir_cur  = rounds[r_idx]
+        # 1) g_prev (streaming reduce)
+        sums = None
+        cnt  = 0
+        for cid in range(total_clients):
+            sd_prev = _load_client_sd(dir_prev, cid)
+            if sd_prev is None:
+                continue
+            if sums is None:
+                # clone到float，便于 in-place 累加
+                sums = {k: v.detach().to('cpu', dtype=torch.float32).clone() for k, v in sd_prev.items()}
+            else:
+                for k in sums.keys():
+                    sums[k].add_(sd_prev[k].to(dtype=torch.float32))
+            cnt += 1
+            del sd_prev
+        if not cnt:
+            continue
+        for k in sums.keys():
+            sums[k].div_(float(cnt))
+        # 2) 本轮各客户端 Δ
+        deltas_this_round = {}
+        for cid in range(total_clients):
+            sd_cur = _load_client_sd(dir_cur, cid)
+            if sd_cur is None:
+                continue
+            d = {k: (sd_cur[k].to('cpu', dtype=torch.float32) - sums[k]) for k in sums.keys() if k in sd_cur}
+            deltas_this_round[cid] = d
+            del sd_cur
+        yield (r_cur, deltas_this_round)
+        # 3) 及时释放
+        del deltas_this_round, sums
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 
 # ---- MIA 结果瘦身：只保留标量，丢弃巨大数组，便于写入 summary.json ----
 def _shrink_mia_result(res):
@@ -300,9 +347,9 @@ parser.add_argument('--fair_vue_debug', type=str2bool, default=False,
                     help='是否打印 FAIR-VUE 调试信息（True/False）')
 parser.add_argument('--fair_erase_scale', type=float, default=0.25,
                     help='特异分量擦除强度 (0,1]，默认0.25，建议先小后大')
-parser.add_argument('--fair_auto_erase', type=str2bool, default=True,
+parser.add_argument('--fair_auto_erase', type=str2bool, default=False,
                     help='自动调参 erase_scale 以拟合重训练（默认开启）')
-parser.add_argument('--fair_auto_tune_all', type=str2bool, default=True,
+parser.add_argument('--fair_auto_tune_all', type=str2bool, default=False,
                     help='联合自动调参 Fisher批次 / rank_k / tau_mode（默认开启）')
 parser.add_argument('--fair_fisher_grid', type=str, default='1,2,5,10',
                     help='Fisher 批次数候选（逗号分隔），用于稳定性搜索')
@@ -322,6 +369,11 @@ parser.add_argument('--fair_bisect_steps', type=int, default=3,
                     help='命中区间后的二分细化步数')
 parser.add_argument('--skip_retraining', type=str2bool, default=False,
                     help='是否跳过重训练阶段（True/False）')
+# —— 新增：严格控制 FAIR-VUE 的内存/样本规模 ——
+parser.add_argument('--fair_target_rounds', type=int, default=100,
+                    help='仅取最近 R 轮目标客户端增量')
+parser.add_argument('--fair_rho_max_samples', type=int, default=128,
+                    help='ρ 的其它客户端子采样上限（默认 128）')
 
 # backdoor attack related arguments
 parser.add_argument('--apply_backdoor', type=str2bool, default=False,
@@ -367,7 +419,7 @@ parser.add_argument('--device', type=str, default='cpu',
                     choices=["cpu", "cuda"], help='device name')
 parser.add_argument('--seed', type=int, default=None, help='random seed')
 parser.add_argument('--verbose', type=bool, default=True, help='verbose')
-parser.add_argument("--num_workers", type=int, default=32,
+parser.add_argument("--num_workers", type=int, default=0,
                     help="number of workers for data loading")
 
 # create argument parser ...
@@ -480,7 +532,7 @@ if __name__ == "__main__":
 
     if args.client_data_distribution == 'dirichlet':
         clientwise_dataset = create_dirichlet_data_distribution(train_dataset,
-                                                                num_clients=args.total_num_clients, num_classes=num_classes, alpha=0.3)
+                                                                num_clients=args.total_num_clients, num_classes=num_classes, alpha=0.5)
     elif args.client_data_distribution == 'iid':
         clientwise_dataset = create_iid_data_distribution(train_dataset, num_clients=args.total_num_clients,
                                                           num_classes=num_classes)
@@ -1171,48 +1223,59 @@ if __name__ == "__main__":
             _t0 = time.time()
             fair_model = deepcopy(global_model).to(args.device)
             fair_model.eval()
-            param_keys = [name for name, p in fair_model.named_parameters() if p.requires_grad]
+            # —— 参与子空间的参数集合：优先分类头，其次 layer4，兼容多种命名
+            all_param_keys = [name for name, p in fair_model.named_parameters() if p.requires_grad]
+            preferred = ("fc.", "linear.", "classifier.", "head.", "layer4.")
+            param_keys = [k for k in all_param_keys if any(k.startswith(pref) for pref in preferred)]
+            if len(param_keys) == 0:
+                # 兜底：取最后若干层（通常是分类头），避免空集合
+                param_keys = all_param_keys[-min(4, len(all_param_keys)):]
+            if args.fair_vue_debug:
+                print(f"[FV-DBG] param_keys selected (n={len(param_keys)}): {param_keys[:6]}{'...' if len(param_keys)>6 else ''}")
             from FedUnlearner.baselines.fair_vue.subspace import (
-                weighted_matrix_from_deltas_keys, rho_values_keys,
+                weighted_matrix_from_deltas_keys, rho_values_keys, topk_right_singular_vectors_gram,
                 flatten_by_keys, state_dict_like_by_keys
             )
 
             # 1) 按轮读取所有客户端逐轮增量 Δ_{cid}^{(r)}
             # 尊重 --skip_training 时传入的 --full_training_dir；否则沿用上文解析出的 train_path
             fv_train_path = os.path.abspath(args.full_training_dir) if args.full_training_dir else os.path.abspath(train_path)
-            round_client_deltas = _build_round_deltas(fv_train_path, args.total_num_clients)
-
-            # === 插入点 A：刚刚构造完 round_client_deltas 之后 ===
-            if args.fair_vue_debug:
-                rounds = sorted(list(round_client_deltas.keys()))
-                print(f"[FV-DBG] rounds_with_deltas={len(rounds)} -> {rounds[:8]}{'...' if len(rounds)>8 else ''}")
-                total_pairs = sum(len(v) for v in round_client_deltas.values())
-                print(f"[FV-DBG] total (round,client) delta pairs={total_pairs}")
-                # 打印前3个轮的 Δ 范数均值
-                from statistics import mean
-                def _flat_norm(d): 
-                    import torch
-                    from FedUnlearner.baselines.fair_vue.subspace import flatten_state_dict
-                    return float(torch.norm(flatten_state_dict(d)).item())
-                for r in rounds[:3]:
-                    ns = [ _flat_norm(d) for d in round_client_deltas[r].values() ]
-                    print(f"[FV-DBG] round={r} mean||Δ||={mean(ns):.3e} (n={len(ns)})")
-
-            if len(round_client_deltas) == 0:
-                raise RuntimeError(f"[FAIR-VUE] 没有从 {fv_train_path} 解析到逐轮的 client 权重，无法构造增量。")
-
-            # 2) 目标客户端历史：拼成列表用于SVD；其它客户端的增量合起来用于ρ
+            # —— 改为“流式”收集：仅保留最近 R 轮目标增量 + 最后一轮其它客户端
+            from collections import deque
             target_id = args.forget_clients[0]
-            target_deltas_list = []
-            other_deltas_list  = []
+            buf_T = deque(maxlen=max(1, int(args.fair_target_rounds)))
+            last_others = []
+            rounds_seen = 0
+            for r_cur, deltas_r in _iter_round_deltas_stream(fv_train_path, args.total_num_clients):
+                rounds_seen += 1
+                if target_id in deltas_r:
+                    buf_T.append(deltas_r[target_id])
+                last_others = [d for cid, d in deltas_r.items() if cid != target_id]
+                # 释放本轮临时
+                del deltas_r
+            target_deltas_list = list(buf_T)
+            other_deltas_list  = last_others
 
-            for r, deltas in round_client_deltas.items():
-                if target_id in deltas:
-                    target_deltas_list.append(deltas[target_id])
-                # 其它客户端
-                for cid, d in deltas.items():
-                    if cid != target_id:
-                        other_deltas_list.append(d)
+            # === 诊断（不再依赖 rounds / round_client_deltas）===
+            if args.fair_vue_debug:
+                print(f"[FV-DBG] rounds_seen={rounds_seen}, T={len(target_deltas_list)}, M={len(other_deltas_list)}")
+                # 打印：目标增量前3个的范数，以及最后一轮其它客户端增量的均值范数
+                from statistics import mean
+                import torch as _torch
+                from FedUnlearner.baselines.fair_vue.subspace import flatten_state_dict
+                def _flat_norm(d):
+                    return float(_torch.norm(flatten_state_dict(d)).item())
+                head_T = target_deltas_list[:3]
+                if head_T:
+                    ns_T = [_flat_norm(d) for d in head_T]
+                    print(f"[FV-DBG] target_deltas head norms: {[f'{v:.3e}' for v in ns_T]}")
+                if other_deltas_list:
+                    ns_O = [_flat_norm(d) for d in other_deltas_list]
+                    print(f"[FV-DBG] others(last round) mean||Δ||={mean(ns_O):.3e} (n={len(ns_O)})")
+
+            if len(target_deltas_list) == 0:
+                raise RuntimeError(f"[FAIR-VUE] 没有解析到目标客户端的逐轮增量，无法进行 SVD/Gram。")
+
 
             if len(target_deltas_list) == 0:
                 raise RuntimeError("[FAIR-VUE] 没有找到目标客户端的逐轮增量，无法进行SVD。")
@@ -1231,6 +1294,8 @@ if __name__ == "__main__":
 
                 # —— 仅参数键，保证与 Fisher 的键一致
                 param_keys = [name for (name, _p) in fair_model.named_parameters()]
+                # 与主流程一致，仅保留分类头与 layer4
+                param_keys = [k for k in param_keys if k.startswith("fc.") or k.startswith("layer4.")]
 
                 # ——（1）Fisher 批次数：稳定性（与 ≥2b 对比的余弦相似度）
                 def _parse_list_csv(s: str):
@@ -1267,7 +1332,7 @@ if __name__ == "__main__":
                 # ——（2）rank_k：Fisher 加权的 Δ_target 历史矩阵的 SVD 累计能量阈值
                 if len(target_deltas_list) >= 1:
                     import torch
-                    Xw = weighted_matrix_from_deltas_keys(target_deltas_list, chosen_fisher, param_keys, device=args.device)
+                    Xw = weighted_matrix_from_deltas_keys(target_deltas_list, chosen_fisher, param_keys, device="cpu")
                     Xc = Xw - Xw.mean(dim=0, keepdim=True)
                     U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
                     energy = (S**2); cum = torch.cumsum(energy, dim=0); total = torch.sum(energy) + 1e-12
@@ -1310,7 +1375,7 @@ if __name__ == "__main__":
             if target_id in client_endpoints:
                 fisher = client_endpoints[target_id].compute_fisher(
                     model_state_dict=fair_model.state_dict(),
-                    device=args.device,
+                    device="cpu",
                     max_batches=args.fair_fisher_batches
                 )
             else:
@@ -1327,25 +1392,36 @@ if __name__ == "__main__":
                     f"mean={float(torch.mean(fvec)): .3e}")
 
             # 4) Fisher加权矩阵 & 低秩SVD拿到主方向V
-            Xw = weighted_matrix_from_deltas_keys(target_deltas_list, fisher, param_keys, device=args.device)  # 已在GPU
-            # === Xw / SVD 完成后，插入点 C ===
+            #    与 Fisher / deltas 对齐 keys，避免空拼接或维度不一致
+            fisher_keys = set(fisher.keys())
+            keys_valid = [k for k in param_keys
+                          if (k in fisher_keys)
+                          and all(k in d for d in target_deltas_list)
+                          and (len(other_deltas_list) == 0 or all(k in d for d in other_deltas_list))]
+            if len(keys_valid) == 0:
+                # 放宽：只强制覆盖 target_deltas
+                keys_valid = [k for k in param_keys if (k in fisher_keys) and all(k in d for d in target_deltas_list)]
+            if len(keys_valid) == 0:
+                raise RuntimeError(
+                    f"[FAIR-VUE] 参与子空间的参数键为空。示例 param_keys={param_keys[:6]}，"
+                    f"fisher_keys={len(fisher_keys)}。请检查分类头命名（如 fc./linear./classifier./head./layer4.）"
+                )
             if args.fair_vue_debug:
-                # Xw: T x D; V: D x k; SVD 的奇异值能反映主方向能量
-                print(f"[FV-DBG] Xw.shape={tuple(Xw.shape)}, device={Xw.device}")
+                print(f"[FV-DBG] using {len(keys_valid)} keys for subspace: {keys_valid}")
+            Xw = weighted_matrix_from_deltas_keys(target_deltas_list, fisher, keys_valid, device="cpu")
+            k = int(args.fair_rank_k)
+            if k > Xw.shape[0]:
+                k = Xw.shape[0]
+            V = topk_right_singular_vectors_gram(Xw, k=k)  # D × k
+            # === 诊断与设备设置（简化，移除坏掉的 f-string 与重复赋值） ===
+            if args.fair_vue_debug:
+                # Xw: T x D; V: D x k
+                print(f"[FV-DBG] Xw shape={tuple(Xw.shape)}, device={Xw.device}")
             V  = topk_right_singular_vectors(Xw, k=args.fair_rank_k)
-            if args.fair_vue_debug:
-                # 重新SVD一次拿 S，不影响 V（只做诊断）
-                U_, S_, Vh_ = torch.linalg.svd(Xw - Xw.mean(dim=0, keepdim=True), full_matrices=False)
-                top_s = [float(s) for s in S_[:min(8, S_.numel())]]
-                print(f"[FV-DBG] top singular values={top_s}, k={V.shape[1]}, V.device={V.device}")                 # 跟随Xw的device
-            dev = V.device  # ★ 统一使用这个设备（通常是cuda:0）
-
-
-
-            dev = V.device
+            dev = V.device  # 统一使用这个设备
 
             # 5) 计算ρ并按阈值切分为 V_spec / V_comm
-            rhos = rho_values_keys(V, other_deltas_list, param_keys)  # 内部已用 V.device 对齐
+            rhos = rho_values_keys(V, other_deltas_list, keys_valid, max_samples=int(args.fair_rho_max_samples))  # 内部已用 V.device 对齐
             if len(rhos) == 0:
                 tau = float('inf')
             else:
@@ -1393,22 +1469,19 @@ if __name__ == "__main__":
             # 7) 逐轮累计“特异分量”
             # 只在 parameters 空间累积“目标客户端”的特异分量
             start_sd = {k: v.detach().clone().cpu() for k, v in fair_model.state_dict().items()}
-            Dparam   = flatten_by_keys(start_sd, param_keys).numel()
+            Dparam   = flatten_by_keys(start_sd, keys_valid).numel()
             spec_total = torch.zeros(Dparam, device=dev)
 
+            # 仅基于已构建好的 target_deltas_list（避免再次引用 round_client_deltas）
             used_rounds = 0
-            for r, deltas in round_client_deltas.items():
-                if target_id not in deltas:
-                    continue
-                # 仅取目标客户端
-                d_tar = flatten_by_keys(deltas[target_id], param_keys, device=dev)  # Δ_target^t
+            for d in target_deltas_list:
+                d_tar = flatten_by_keys(d, keys_valid, device=dev)  # Δ_target^t
                 if Q is not None:
-                    spec = Q @ (Q.T @ d_tar)  # 只拿“目标”的特异分量
+                    spec = Q @ (Q.T @ d_tar)     # 只拿“目标”的特异分量
                 else:
                     spec = torch.zeros_like(d_tar, device=dev)
                 spec_total += spec
                 used_rounds += 1
-
             if args.fair_vue_debug:
                 print(f"[FV-DBG] used_rounds_for_target={used_rounds}, ||spec_total||_2={float(torch.norm(spec_total)):.3e}")
 

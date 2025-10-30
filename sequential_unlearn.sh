@@ -11,7 +11,7 @@ OPTIMIZER="sgd"
 TOTAL_CLIENTS=20
 ITERS=200
 DEVICE="cuda"
-LR=0.01
+LR=0.1
 EPOCHS=1
 SEED=42
 FULL_TRAIN_DIR="./experiments/cifar100_resnet18/full_training"
@@ -19,9 +19,9 @@ DISTRIBUTION="dirichlet"
 BASE_EXP_NAME="cifar100_resnet18"
 
 # 超参数取值范围
-FAIR_RANK_LIST=(25)
-FAIR_TAU_MODES=("median")
-FAIR_FISHER_BATCHES=(10)
+FAIR_RANK_LIST=(100)
+FAIR_TAU_MODES=("mean")
+FAIR_FISHER_BATCHES=(100)
 FAIR_ERASE_SCALES=(1)
 FORGET_CLIENTS=(0)
 
@@ -65,6 +65,8 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --full_training_dir $FULL_TRAIN_DIR \
             --retraining_dir $RETRAIN_MODEL_PATH \
             --apply_membership_inference true \
+            --fair_auto_tune_all false \
+            --fair_auto_erase false \
 
 
           echo "✅ 完成：client=${CID}, k=${RANK_K}, tau=${TAU_MODE}, fb=${FISHER_B}, es=${ERASE_S}"

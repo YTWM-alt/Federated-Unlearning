@@ -5,6 +5,7 @@ from typing import Tuple, Dict
 from FedUnlearner.utils import average_weights
 from copy import deepcopy
 from tqdm import tqdm
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import shutil
 import os
 
@@ -58,12 +59,23 @@ def fed_train(num_training_iterations: int, test_dataloader: torch.utils.data.Da
             else:
                 raise ValueError(f"Optimizer {optimizer_name} not supported")
             
-            loss_fn = torch.nn.CrossEntropyLoss()  # create loss function
-            
-            
-            train_local_model(model = client_model, dataloader = client_dataloader, 
-                              loss_fn = loss_fn, optimizer = optimizer, num_epochs = num_local_epochs, 
-                              device = device)
+            # === Cosine 学习率调度（按 batch 衰减）===
+            # T_max = 本地总步数；eta_min 可按需改成 lr*0.01 或 0.0，这里给个温和下限
+            _steps_per_epoch = max(1, len(client_dataloader))
+            _tmax = max(1, num_local_epochs * _steps_per_epoch)
+            scheduler = CosineAnnealingLR(optimizer, T_max=_tmax, eta_min=lr*0.01)
+
+            loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+
+            train_local_model(
+                model=client_model,
+                dataloader=client_dataloader,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                num_epochs=num_local_epochs,
+                device=device,
+                scheduler=scheduler,                 # 新增
+            )
             torch.save(client_model.state_dict(), os.path.join(iteration_weights_path, f"client_{client_idx}.pth"))
 
             # test_acc_client, test_loss_client = test_local_model(client_model, test_dataloader, loss_fn, device)
@@ -118,8 +130,9 @@ def fed_train(num_training_iterations: int, test_dataloader: torch.utils.data.Da
             
 
 @typechecked
-def train_local_model(model: torch.nn.Module, dataloader: torch.utils.data.DataLoader, loss_fn, 
-                        optimizer: torch.optim.Optimizer, num_epochs: int, device: str = 'cpu'):
+def train_local_model(model: torch.nn.Module, dataloader: torch.utils.data.DataLoader, loss_fn,
+                      optimizer: torch.optim.Optimizer, num_epochs: int, device: str = 'cpu',
+                      scheduler=None):
     model = model.to(device)
     model.train()
 
@@ -134,7 +147,16 @@ def train_local_model(model: torch.nn.Module, dataloader: torch.utils.data.DataL
             loss = loss_fn(log_probs, labels)
             loss.backward()
             optimizer.step()
-            tqdm_iterator.set_postfix({"loss": loss.item()})
+            
+            # 余弦调度按 batch 步进，适合本地 epoch 较小的联邦场景
+            if scheduler is not None:
+                scheduler.step()
+            # 可选：把当前 LR 打到进度条里便于观察
+            try:
+                cur_lr = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
+                tqdm_iterator.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{cur_lr:.5f}"})
+            except Exception:
+                tqdm_iterator.set_postfix({"loss": f"{loss.item():.4f}"})
 
     return model.state_dict()
 

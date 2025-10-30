@@ -31,15 +31,28 @@ def get_dataset(dataset_name: str) -> Tuple[torch.utils.data.Dataset, torch.util
 
     elif dataset_name == 'cifar100':
         data_dir = './data/cifar100/'
-        apply_transform = transforms.Compose(
-            [transforms.Resize(size=(32, 32)),
-             transforms.ToTensor(),
-             # CIFAR-100 使用与 CIFAR-10 相同的像素归一化均值/方差
-             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
-        train_dataset = datasets.CIFAR100(data_dir, train=True, download=True,
-                                          transform=apply_transform)
-        test_dataset = datasets.CIFAR100(data_dir, train=False, download=True,
-                                         transform=apply_transform)
+        mean = (0.4914, 0.4822, 0.4465)
+        std  = (0.2023, 0.1994, 0.2010)
+        # 训练增强：标准 CIFAR 套餐
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+            transforms.RandomErasing(p=0.25)
+        ])
+        # 测试/评估：只做归一化
+        test_transform = transforms.Compose([
+            transforms.Resize(size=(32, 32)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+        train_dataset = datasets.CIFAR100(
+            data_dir, train=True, download=True, transform=train_transform
+        )
+        test_dataset = datasets.CIFAR100(
+            data_dir, train=False, download=True, transform=test_transform
+        )
         return train_dataset, test_dataset, 100
 
     elif dataset_name == 'mnist':

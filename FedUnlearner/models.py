@@ -131,6 +131,7 @@ class ResNet18(nn.Module):
     def __init__(self, num_channels=3, num_classes=10, pretrained=False):
         super().__init__()
         base = resnet18(pretrained=pretrained)
+
         self.base = nn.Sequential(*list(base.children())[:-1])
         if pretrained:
             for param in self.base.parameters():
