@@ -370,7 +370,7 @@ parser.add_argument('--fair_bisect_steps', type=int, default=3,
 parser.add_argument('--skip_retraining', type=str2bool, default=False,
                     help='是否跳过重训练阶段（True/False）')
 # —— 新增：严格控制 FAIR-VUE 的内存/样本规模 ——
-parser.add_argument('--fair_target_rounds', type=int, default=100,
+parser.add_argument('--fair_target_rounds', type=int, default=200,
                     help='仅取最近 R 轮目标客户端增量')
 parser.add_argument('--fair_rho_max_samples', type=int, default=128,
                     help='ρ 的其它客户端子采样上限（默认 128）')
@@ -1293,9 +1293,11 @@ if __name__ == "__main__":
                     print("[FV-AUTO] ==== Start auto-tuning {fisher_batches, rank_k, tau_mode} ====")
 
                 # —— 仅参数键，保证与 Fisher 的键一致
-                param_keys = [name for (name, _p) in fair_model.named_parameters()]
-                # 与主流程一致，仅保留分类头与 layer4
-                param_keys = [k for k in param_keys if k.startswith("fc.") or k.startswith("layer4.")]
+                all_param_keys = [name for name, p in fair_model.named_parameters() if p.requires_grad]
+                preferred = ("fc.", "linear.", "classifier.", "head.", "layer4.")
+                param_keys = [k for k in all_param_keys if any(k.startswith(pref) for pref in preferred)]
+                if not param_keys:  # 兜底：避免空集合
+                    param_keys = all_param_keys[-min(4, len(all_param_keys)):]
 
                 # ——（1）Fisher 批次数：稳定性（与 ≥2b 对比的余弦相似度）
                 def _parse_list_csv(s: str):
@@ -1304,7 +1306,11 @@ if __name__ == "__main__":
                 stability = float(args.fair_fisher_stability)
                 def _flatten_fi(Fi: dict):
                     import torch
-                    return torch.cat([Fi[k].detach().flatten().float().cpu() for k in param_keys if k in Fi])
+                    xs = [Fi[k].detach().flatten().float().cpu() for k in param_keys if k in Fi]
+                    if not xs:
+                        # 兜底：至少用 Fi 的全部键拼成向量（仍可用于相似度判断）
+                        xs = [v.detach().flatten().float().cpu() for v in Fi.values()]
+                    return torch.cat(xs) if xs else torch.zeros(1)
                 def _cos(a,b):
                     import torch
                     na, nb = torch.norm(a), torch.norm(b)

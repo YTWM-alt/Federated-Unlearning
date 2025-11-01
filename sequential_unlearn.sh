@@ -19,10 +19,10 @@ DISTRIBUTION="dirichlet"
 BASE_EXP_NAME="cifar100_resnet18"
 
 # 超参数取值范围
-FAIR_RANK_LIST=(100)
+FAIR_RANK_LIST=(16)
 FAIR_TAU_MODES=("mean")
-FAIR_FISHER_BATCHES=(100)
-FAIR_ERASE_SCALES=(1)
+FAIR_FISHER_BATCHES=(10)
+FAIR_ERASE_SCALES=(0.15)
 FORGET_CLIENTS=(0)
 
 # 循环执行实验
@@ -60,13 +60,13 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --fair_fisher_batches $FISHER_B \
             --fair_erase_scale $ERASE_S \
             --fair_vue_debug true \
-            --skip_training false \
-            --skip_retraining false \
+            --skip_training true \
+            --skip_retraining true \
             --full_training_dir $FULL_TRAIN_DIR \
             --retraining_dir $RETRAIN_MODEL_PATH \
             --apply_membership_inference true \
-            --fair_auto_tune_all false \
-            --fair_auto_erase false \
+            --fair_auto_tune_all true \
+            --fair_auto_erase true \
 
 
           echo "✅ 完成：client=${CID}, k=${RANK_K}, tau=${TAU_MODE}, fb=${FISHER_B}, es=${ERASE_S}"
