@@ -6,7 +6,7 @@ from copy import deepcopy
 import os
 from tqdm import tqdm
 
-from .pga_utils import get_model_ref, get_threshold, unlearn
+from .pga_utils import get_model_ref, get_threshold, unlearn, get_distance
 from FedUnlearner.fed_learn import train_local_model
 from FedUnlearner.utils import average_weights
 
@@ -70,11 +70,17 @@ def run_pga(global_model: torch.nn.Module,
                               pretrained=pretrained,
                               device=device)
 
+    # —— 自适应的距离阈值（替代之前写死的 2.2）——
+    # 直观含义：要求当前全局模型相对于“参考模型(model_ref)”的状态，
+    # 至少要“远离”到与遗忘客户端最后一轮模型相当的尺度。
+    # 注意：get_distance 返回张量，这里取 float。
+    distance_threshold = float(get_distance(model_ref, forget_client_model).item())
+
     unlearned_global_model = unlearn(
         global_model=global_model,
         forget_client_model=forget_client_model,
         model_ref=model_ref,
-        distance_threshold=2.2,
+        distance_threshold=distance_threshold,
         loader=clientwise_dataloaders[forget_client[0]],
         optimizer_name=optimizer_name,
         device=device,
@@ -88,6 +94,13 @@ def run_pga(global_model: torch.nn.Module,
     ######################## post train ############################
 
     finetuned_model = deepcopy(unlearned_global_model)
+
+
+    # —— finetune 学习率与训练 lr 解耦，避免把遗忘效果洗回去 ——
+    # 若用户训练 lr 很大（如 0.1），这里收敛会过猛；默认收敛到不超过 1e-2。
+    # 如需自定义，可在后续扩展成入参；当前保持向后兼容。
+    finetune_lr = lr if lr <= 0.01 else 0.01
+
 
     for round in range(num_post_training_rounds):
         print(f"Finetuning PGA unlearned Model: {round}")
@@ -103,9 +116,9 @@ def run_pga(global_model: torch.nn.Module,
             if client_idx == forget_client[0]:
                 continue
             if optimizer_name == 'adam':
-                optimizer = torch.optim.Adam(client_model.parameters(), lr=lr)
+                optimizer = torch.optim.Adam(client_model.parameters(), lr=finetune_lr)
             elif optimizer_name == 'sgd':
-                optimizer = torch.optim.SGD(client_model.parameters(), lr=lr)
+                optimizer = torch.optim.SGD(client_model.parameters(), lr=finetune_lr)
             else:
                 raise ValueError(f"Optimizer {optimizer_name} not supported")
 
