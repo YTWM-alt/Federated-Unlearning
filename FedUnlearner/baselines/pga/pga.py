@@ -74,7 +74,8 @@ def run_pga(global_model: torch.nn.Module,
     # 直观含义：要求当前全局模型相对于“参考模型(model_ref)”的状态，
     # 至少要“远离”到与遗忘客户端最后一轮模型相当的尺度。
     # 注意：get_distance 返回张量，这里取 float。
-    distance_threshold = float(get_distance(model_ref, forget_client_model).item())
+    ALPHA = 0.9  # 0.7/0.85/1.0 三档可切换；建议先 0.85
+    distance_threshold = ALPHA * float(get_distance(model_ref, forget_client_model).item())
 
     unlearned_global_model = unlearn(
         global_model=global_model,

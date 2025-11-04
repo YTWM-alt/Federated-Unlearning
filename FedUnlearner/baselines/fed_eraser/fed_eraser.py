@@ -1,192 +1,212 @@
-from typeguard import typechecked
-from typing import Dict, List, Tuple, Union
+# -*- coding: utf-8 -*-
+"""
+FedEraser baseline (reliable & memory-safe)
+-------------------------------------------
+- Load checkpoints on CPU, move tensors to device only when needed
+- Fix: optimizer must bind the actual client_model used in calibration
+- Fix: keep all tensors on the same device during vector math
+- Stable normalization with epsilon
+- Safer calibration lr (cap at 1e-2 by default)
+
+Expected external deps in your repo:
+- FedUnlearner.utils.average_weights(dir, device) -> Dict[str, Tensor]
+- FedUnlearner.fed_learn.train_local_model(model, dataloader, loss_fn, optimizer, num_epochs, device) -> state_dict
+- FedUnlearner.fed_learn.fed_avg(list_of_state_dicts) -> Dict[str, Tensor]
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Dict, List
+from copy import deepcopy
+
 import torch
-from FedUnlearner.utils import average_weights
-from FedUnlearner.fed_learn import *
+import torch.nn as nn
 from tqdm import tqdm
-import copy
+
+from FedUnlearner.utils import average_weights
+from FedUnlearner.fed_learn import train_local_model
 
 
-def fed_avg(w):
+# ---- utils -----------------------------------------------------------------
+
+def _safe_load(path: str):
     """
-    Returns the average of the weights.
+    torch.load with CPU map_location. If PyTorch supports weights_only, use it.
+    This is backward compatible with older torch versions.
     """
-    w_avg = deepcopy(w[0])
-    for key in w_avg.keys():
-        for i in range(1, len(w)):
-            w_avg[key] += w[i][key]
-        w_avg[key] = torch.div(w_avg[key], len(w))
-    return w_avg
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        # older torch: no 'weights_only'
+        return torch.load(path, map_location="cpu")
 
+
+def _sd_to_device(sd: Dict[str, torch.Tensor], device: torch.device | str) -> Dict[str, torch.Tensor]:
+    return {k: v.to(device) for k, v in sd.items()}
+
+def _simple_fed_avg(list_params: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """
+    In-memory FedAvg over a list of state_dicts (uniform weights).
+    Assume tensors already on the same device/dtype.
+    """
+    assert len(list_params) > 0, "list_params is empty"
+    out: Dict[str, torch.Tensor] = {}
+    keys = list_params[0].keys()
+    for k in keys:
+        # stack -> mean 更稳；避免 python 累加产生的 dtype/device 不一致
+        stacked = torch.stack([sd[k] for sd in list_params], dim=0)
+        out[k] = stacked.mean(dim=0)
+    return out
+
+
+# ---- core one-step geometry -------------------------------------------------
 
 def fed_eraser_one_step(
-    old_client_models,
-    new_client_models,
-    global_model_before_forget,
-    global_model_after_forget,
-    device
-):
-    old_param_update = dict()  # oldCM - oldGM_t
-    new_param_update = dict()  # newCM - newGM_t
+    old_client_models: List[Dict[str, torch.Tensor]],
+    new_client_models: List[Dict[str, torch.Tensor]],
+    global_model_before_forget: Dict[str, torch.Tensor],
+    global_model_after_forget: Dict[str, torch.Tensor],
+    device: torch.device | str,
+    eps: float = 1e-12,
+) -> Dict[str, torch.Tensor]:
+    """
+    Implements:  newGM_t  +  ||sum_i (oldCM_i - oldGM_t)|| *  (sum_i (newCM_i - newGM_t)) / ||sum_i (newCM_i - newGM_t)||
 
-    new_global_model_state = global_model_after_forget  # newGM_t
-    return_model_state = (
-        dict()
-    )  # newGM_t + ||oldCM - oldGM_t||*(newCM - newGM_t)/||newCM - newGM_t||
+    All inputs are moved to `device` inside.
+    """
 
-    assert len(old_client_models) == len(new_client_models)
-    for layer in global_model_before_forget.keys():
-        old_param_update[layer] = 0 * global_model_before_forget[layer]
-        new_param_update[layer] = 0 * global_model_before_forget[layer]
-        return_model_state[layer] = 0 * global_model_before_forget[layer]
+    # ensure same device
+    oldGM = _sd_to_device(global_model_before_forget, device)
+    newGM = _sd_to_device(global_model_after_forget, device)
+    oldCMs = [_sd_to_device(sd, device) for sd in old_client_models]
+    newCMs = [_sd_to_device(sd, device) for sd in new_client_models]
 
-        for i in range(len(new_client_models)):
-            old_param_update[layer] += old_client_models[i][layer]
-            new_param_update[layer] += new_client_models[i][layer].to(device)
+    out: Dict[str, torch.Tensor] = {}
 
-        old_param_update[layer] /= len(new_client_models)  # oldCM
-        new_param_update[layer] /= len(new_client_models)  # newCM
+    # init accumulators
+    for layer in newGM.keys():
+        out[layer] = newGM[layer].clone()
+        # sum of deltas
+        delta_old_sum = torch.zeros_like(newGM[layer])
+        delta_new_sum = torch.zeros_like(newGM[layer])
 
-        old_param_update[layer] = (
-            old_param_update[layer] - global_model_before_forget[layer]
-        )  # oldCM - oldGM_t
-        new_param_update[layer] = (
-            new_param_update[layer] - global_model_after_forget[layer]
-        )  # newCM - newGM_t
+        for i in range(len(oldCMs)):
+            delta_old_sum = delta_old_sum + (oldCMs[i][layer] - oldGM[layer])
+            delta_new_sum = delta_new_sum + (newCMs[i][layer] - newGM[layer])
 
-        step_length = torch.norm(
-            old_param_update[layer])  # ||oldCM - oldGM_t||
-        step_direction = new_param_update[layer] / torch.norm(
-            new_param_update[layer]
-        )  # (newCM - newGM_t)/||newCM - newGM_t||
+        scale = torch.norm(delta_old_sum)
+        denom = torch.norm(delta_new_sum) + eps
+        step = (scale / denom) * delta_new_sum
+        out[layer] = out[layer] + step
 
-        return_model_state[layer] = (
-            new_global_model_state[layer] + step_length * step_direction
-        )
-
-    return return_model_state
+    return out
 
 
-@typechecked
+# ---- main entry -------------------------------------------------------------
+
 def run_fed_eraser(
-        global_model: torch.nn.Module,
-        weights_path: str,
-        forget_clients: List[int],
-        clientwise_dataloaders: Dict[int, torch.utils.data.DataLoader],
-        device: str,
-        optimizer_name: str,
-        num_clients: int,
-        num_rounds: int,
-        lr: float,
-        num_unlearn_rounds=1,
-        local_cali_round=1,
-        num_post_training_rounds=1) -> torch.nn.Module:
-    old_global_models = []
+    global_model: nn.Module,
+    weights_path: str,
+    forget_clients: List[int],
+    clientwise_dataloaders: Dict[int, torch.utils.data.DataLoader],
+    device: str,
+    optimizer_name: str,
+    num_clients: int,
+    num_rounds: int,
+    lr: float,
+    num_unlearn_rounds: int = 1,
+    local_cali_round: int = 1,
+    num_post_training_rounds: int = 1,
+) -> nn.Module:
+    """
+    Args:
+        weights_path: path to full_training dir with iteration_{r}/global_model.pth & client_{i}.pth
+        forget_clients: list of client ids to forget (this impl assumes single forget client in main)
+        num_rounds: should match your training rounds
+    """
+    device = torch.device(device)
 
-    for round in range(num_rounds):
-        global_weights_path = os.path.join(weights_path,
-                                           f"iteration_{round}",
-                                           "global_model.pth")
-        global_param = torch.load(global_weights_path)
-        old_global_models.append(global_param)
+    # 1) preload all old global models (CPU tensors)
+    old_global_models: List[Dict[str, torch.Tensor]] = []
+    for rnd in range(num_rounds):
+        gpath = os.path.join(weights_path, f"iteration_{rnd}", "global_model.pth")
+        old_global_models.append(_safe_load(gpath))
 
-    # new_global_models = []
-    chosen_clients = [i for i in range(0, num_clients)
-                      if i not in forget_clients]
-    rounds = [i
-              for i in range(0, num_rounds, num_rounds // num_unlearn_rounds)]
-    new_prev_global_model = copy.deepcopy(global_model)
-    for i, round in enumerate(rounds):
-        iteration_weights_path = os.path.join(weights_path,
-                                              f"iteration_{round}")
-        roundth = num_rounds + i
-        print(f"Round {roundth+1}/{num_rounds + num_unlearn_rounds}")
-        list_params = []
+    # chosen clients = retain set
+    chosen_clients = [i for i in range(num_clients) if i not in forget_clients]
 
-        old_client_parameters = []
-        new_client_parameters = []
-        # For first round of unlearning, only fedavg client upates
-        if round == 0:
-            for client in chosen_clients:
-                client_parameters = torch.load(os.path.join(iteration_weights_path,
-                                                            f"client_{client}.pth"))
-                old_client_parameters.append(client_parameters)
+    # 2) one-step geometry per round, keep the *last* as the final unlearned state
+    unlearned_global_model = deepcopy(global_model)
+    for rnd in range(num_rounds):
+        iter_dir = os.path.join(weights_path, f"iteration_{rnd}")
 
-            new_global_model = average_weights(
-                iteration_weights_path, device=device)
-            # new_global_models.append(new_global_model)
-            continue
+        old_prev_global = old_global_models[rnd]  # CPU dict
 
-        old_global_model = old_global_models[round]
+        # load old/new client parameters (CPU)
+        old_client_parameters: List[Dict[str, torch.Tensor]] = []
+        new_client_parameters: List[Dict[str, torch.Tensor]] = []
 
-        new_prev_global_model.load_state_dict(new_global_model)
+        for cid in chosen_clients:
+            old_client_parameters.append(_safe_load(os.path.join(iter_dir, f"client_{cid}.pth")))
 
-        # for other rounds
-        for client in tqdm(chosen_clients):
-            client_parameters = torch.load(os.path.join(iteration_weights_path,
-                                                        f"client_{client}.pth"))
-            old_client_parameters.append(client_parameters)
+        # new_prev_global_model = FedAvg of this round (on device)
+        new_prev_global = average_weights(iter_dir, device=device)
 
-            if optimizer_name == 'adam':
-                optimizer = torch.optim.Adam(
-                    new_prev_global_model.parameters(), lr=lr)
-            elif optimizer_name == 'sgd':
-                optimizer = torch.optim.SGD(
-                    new_prev_global_model.parameters(), lr=lr)
-            else:
-                raise ValueError(f"Optimizer {optimizer_name} not supported")
+        for cid in chosen_clients:
+            new_client_parameters.append(_safe_load(os.path.join(iter_dir, f"client_{cid}.pth")))
 
-            loss_fn = torch.nn.CrossEntropyLoss()
-            new_client_parameter = train_local_model(
-                model=deepcopy(new_prev_global_model),
-                dataloader=clientwise_dataloaders[client],
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-                num_epochs=local_cali_round,
-                device=device)
-            new_client_parameters.append({k: v.cpu() for k, v in new_client_parameter.items()})
-        # Loss functions
-        new_global_model = fed_eraser_one_step(
-            old_client_parameters,
-            new_client_parameters,
-            old_global_model,
-            new_prev_global_model.state_dict(),
-            device=device
+        # one-step erase on device
+        unlearned_sd = fed_eraser_one_step(
+            old_client_models=old_client_parameters,
+            new_client_models=new_client_parameters,
+            global_model_before_forget=old_prev_global,
+            global_model_after_forget=new_prev_global,  # already on device in average_weights
+            device=device,
         )
-    ### Post train ####
-    unlearned_global_model = copy.deepcopy(global_model)
-    global_param = copy.deepcopy(new_global_model)
-    unlearned_global_model.load_state_dict(new_global_model)
 
-    start_round = num_rounds + len(rounds)
-    end_round = start_round + num_post_training_rounds
-    for round in range(start_round, end_round):
-        chosen_clients = [i for i in range(0, num_clients)
-                          if i not in forget_clients]
-        list_params = []
-        for client in tqdm(chosen_clients):
-            if optimizer_name == 'adam':
-                optimizer = torch.optim.Adam(
-                    unlearned_global_model.parameters(), lr=lr)
-            elif optimizer_name == 'sgd':
-                optimizer = torch.optim.SGD(
-                    unlearned_global_model.parameters(), lr=lr)
-            else:
-                raise ValueError(f"Optimizer {optimizer_name} not supported")
+        # load into model (keep on device for the next stage)
+        unlearned_global_model = deepcopy(global_model).to(device)
+        unlearned_global_model.load_state_dict(unlearned_sd)
 
-            loss_fn = torch.nn.CrossEntropyLoss()
-            print(f"-----------client {client} starts training----------")
-            tem_param = train_local_model(
-                model=deepcopy(unlearned_global_model),
-                dataloader=clientwise_dataloaders[client],
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-                num_epochs=local_cali_round,
-                device=device
-            )
-            list_params.append(tem_param)
+        # free cpu tensors early
+        del old_client_parameters, new_client_parameters
+        torch.cuda.empty_cache()
 
-        # server aggregation
-        global_param = fed_avg(list_params)
-    unlearned_global_model.load_state_dict(global_param)
+    # 3) optional post-training calibration on retain clients
+    if num_post_training_rounds > 0 and len(chosen_clients) > 0:
+        for r in range(num_post_training_rounds):
+            print(f"Finetuning FedEraser unlearned Model: {r}")
+            list_params = []
+
+            # safer calibration lr (avoid washing away geometry step)
+            cali_lr = lr if lr <= 1e-2 else 1e-2
+
+            for cid in tqdm(chosen_clients):
+                client_model = deepcopy(unlearned_global_model).to(device)
+
+                if optimizer_name.lower() == "adam":
+                    optimizer = torch.optim.Adam(client_model.parameters(), lr=cali_lr)
+                elif optimizer_name.lower() == "sgd":
+                    optimizer = torch.optim.SGD(client_model.parameters(), lr=cali_lr, momentum=0.9, weight_decay=5e-4)
+                else:
+                    raise ValueError(f"Optimizer {optimizer_name} not supported")
+
+                loss_fn = nn.CrossEntropyLoss()
+                print(f"-----------client {cid} starts training----------")
+                tem_param = train_local_model(
+                    model=client_model,
+                    dataloader=clientwise_dataloaders[cid],
+                    loss_fn=loss_fn,
+                    optimizer=optimizer,
+                    num_epochs=local_cali_round,
+                    device=device,
+                )
+                list_params.append(tem_param)
+
+            # server aggregation
+            global_param = _simple_fed_avg(list_params)
+            unlearned_global_model.load_state_dict(global_param)
+            torch.cuda.empty_cache()
+
     return unlearned_global_model
