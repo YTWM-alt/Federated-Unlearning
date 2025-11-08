@@ -336,7 +336,7 @@ parser.add_argument('--num_participating_clients', type=int, default=-1, help='n
 
 # baslines
 parser.add_argument('--baselines', type=str, nargs="*", default=[], 
-    choices=['pga', 'fed_eraser', 'fedfim', 'fair_vue', 'fast_fu'],
+    choices=['pga', 'fed_eraser', 'fedfim', 'fair_vue', 'fast_fu', 'quickdrop'],
     help='baseline methods for unlearning')
 
 # ---------- fast-fU 超参（与原实现同名语义） ----------
@@ -346,6 +346,32 @@ parser.add_argument('--fast_alpha', type=float, default=0.5,
     help='fast-fU: alpha coefficient')
 parser.add_argument('--fast_theta', type=float, default=1.0,
     help='fast-fU: theta scaling for unlearning term')
+
+# ---------- QuickDrop 超参（贴近原实现命名/语义） ----------
+parser.add_argument('--qd_scale', type=float, default=0.01,
+    help='QuickDrop: 每类合成样本比例（如 0.01 表示每类约 1%）')
+parser.add_argument('--qd_method', type=str, default='dc', choices=['dc'],
+    help='QuickDrop: 蒸馏方法（此实现提供 DC/gradient matching 变体）')
+parser.add_argument('--qd_syn_steps', type=int, default=10,
+    help='QuickDrop: 蒸馏外循环步数（优化合成图像）')
+parser.add_argument('--qd_lr_img', type=float, default=0.1,
+    help='QuickDrop: 合成图像的学习率')
+parser.add_argument('--qd_batch_real', type=int, default=256,
+    help='QuickDrop: 真实批大小（用来计算目标梯度）')
+parser.add_argument('--qd_batch_syn', type=int, default=256,
+    help='QuickDrop: 合成批大小（用来计算匹配梯度）')
+parser.add_argument('--qd_local_epochs', type=int, default=None,
+    help='QuickDrop: 本地训练轮数（默认沿用 num_local_epochs）')
+parser.add_argument('--qd_save_affine', type=str2bool, default=False,
+    help='QuickDrop: 是否保存各客户端合成（affine/synthetic）数据张量')
+parser.add_argument('--qd_affine_dir', type=str, default='quickdrop_affine',
+    help='QuickDrop: 合成数据保存目录（位于 experiments/exp_name 下）')
+parser.add_argument('--qd_log_interval', type=int, default=10,
+    help='QuickDrop: 蒸馏外循环日志步长（每多少步打印一次进度）')
+
+
+
+
 
 # FAIR-VUE 参数
 parser.add_argument('--fair_rank_k', type=int, default=16, help='SVD 主成分数')
@@ -1768,6 +1794,44 @@ if __name__ == "__main__":
                         # 把 retrain 基线用时传给 fast-FU 以输出 Speedup
                         retrain_time_sec=locals().get("t_retrain_sec", None))
             print(">>> fast-fU run finished.")
+
+        elif baseline == 'quickdrop':
+            # ---- QuickDrop（严格贴近原法的 DC/梯度匹配蒸馏 + 合成集本地更新）----
+            from FedUnlearner.baselines import run_quickdrop
+            print(">>> Running QuickDrop (baseline).")
+            _t0 = time.time()
+            qd_model, qd_info = run_quickdrop(
+                args=args,
+                global_model=deepcopy(global_model),
+                # 只在“保留客户端”上参与（与 retraining 保持一致）
+                clientwise_dataloaders=retain_clientwise_dataloaders,
+                test_dataloader=test_dataloader,
+                num_classes=num_classes,
+                device=args.device,
+            )
+            qd_time_sec = time.time() - _t0
+
+            # ==== 六项指标统一打印（QuickDrop）====
+            test_acc_qd    = get_accuracy_only(qd_model, test_dataloader, args.device)
+            target_acc_qd  = get_accuracy_only(qd_model, clientwise_dataloaders[forget_client], args.device)
+            target_loss_qd = eval_ce_loss(qd_model, clientwise_dataloaders[forget_client], args.device)
+            speedup_qd     = (t_retrain_sec / qd_time_sec) if (locals().get('t_retrain_sec', None) is not None and qd_time_sec > 0) else None
+            angle_qd       = cosine_angle_between_models(qd_model, retrained_global_model) if locals().get('has_retrain_baseline', False) else None
+            mia_qd = None
+            if args.apply_membership_inference:
+                mia_qd = evaluate_mia_attack(
+                    target_model=deepcopy(qd_model),
+                    attack_model=locals().get("attack_model", None),
+                    client_loaders=clientwise_dataloaders,
+                    test_loader=test_dataloader,
+                    dataset=args.dataset,
+                    forget_client_idx=args.forget_clients[0],
+                    device=args.device,
+                    eval_nonmem_loader=locals().get("mia_eval_nonmem_loader", None)
+                )
+            print_forgetting_metrics("QuickDrop", test_acc_qd, target_acc_qd, target_loss_qd, speedup_qd, angle_qd, mia_qd)
+            # 供后续可能的二次评测使用
+            unlearned_quickdrop_model = deepcopy(qd_model)
 
 
         # ----------------- FedFIM -----------------
