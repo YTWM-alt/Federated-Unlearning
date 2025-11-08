@@ -336,8 +336,16 @@ parser.add_argument('--num_participating_clients', type=int, default=-1, help='n
 
 # baslines
 parser.add_argument('--baselines', type=str, nargs="*", default=[], 
-    choices=['pga', 'fed_eraser', 'fedfim', 'fair_vue'],
+    choices=['pga', 'fed_eraser', 'fedfim', 'fair_vue', 'fast_fu'],
     help='baseline methods for unlearning')
+
+# ---------- fast-fU 超参（与原实现同名语义） ----------
+parser.add_argument('--fast_expected_saving', type=int, default=5,
+    help='fast-fU: expected number of saved client updates (m)')
+parser.add_argument('--fast_alpha', type=float, default=0.5,
+    help='fast-fU: alpha coefficient')
+parser.add_argument('--fast_theta', type=float, default=1.0,
+    help='fast-fU: theta scaling for unlearning term')
 
 # FAIR-VUE 参数
 parser.add_argument('--fair_rank_k', type=int, default=16, help='SVD 主成分数')
@@ -1720,6 +1728,47 @@ if __name__ == "__main__":
                 forget_loader = clientwise_dataloaders[target_id]
                 acc_forget_heal = get_accuracy_only(fair_model, forget_loader, args.device)
                 print(f"[HEAL] 忘却客户端{target_id}自有数据精度(治疗后): {acc_forget_heal*100:.2f}%")
+
+        elif baseline == 'fast_fu':
+            # ---- fast-fU（round-wise） ----
+            # quick adapter that runs the FastFUServer over the existing full_training outputs
+            from FedUnlearner.baselines.fast_fu.fast_fu import run_fast_fu
+            print(">>> Running fast-fU (adapter).")
+            # 1) 映射：forget_clients -> attackers（fast-fU 使用 attackers 触发擦除）
+            if (not hasattr(args, 'attacker')) or (args.attacker is None) or (len(args.attacker) == 0):
+                args.attacker = list(sorted(set(args.forget_clients)))
+
+            # 2) 训练日志路径：指向直接包含 iteration_* 的目录
+            fv_train_path = os.path.abspath(args.full_training_dir) if args.full_training_dir else os.path.abspath(train_path)
+            if os.path.isdir(os.path.join(fv_train_path, 'full_training')):
+                fv_train_path = os.path.join(fv_train_path, 'full_training')
+            if (not os.path.isdir(fv_train_path)) or (not any(n.startswith('iteration_') for n in os.listdir(fv_train_path))):
+                raise FileNotFoundError(
+                    f"[fast-fU] iteration_* not found under: {fv_train_path}. "
+                    "Please set --full_training_dir to the folder that directly contains iteration_*/client_*.pth."
+                )
+
+            # 3) 与 loader 数量对齐，避免扫描不存在的 client id
+            try:
+                args.total_num_clients = max(int(args.total_num_clients), len(clientwise_dataloaders))
+            except Exception:
+                args.total_num_clients = len(clientwise_dataloaders)
+
+            if args.verbose:
+                print(f">>> fast-fU config: attackers={args.attacker}, path='{fv_train_path}'")
+            # call runner — 传入 attack_model 与 eval_nonmem_loader，让 fast-fU 分支内也能跑 MIA（与 PGA 一致）
+            run_fast_fu(args=args,
+                        clientwise_dataloaders=clientwise_dataloaders,
+                        train_path=fv_train_path,
+                        global_model=deepcopy(global_model),
+                        test_dataloader=test_dataloader,
+                        retrained_global_model=deepcopy(retrained_global_model),
+                        attack_model=locals().get("attack_model", None),
+                        eval_nonmem_loader=locals().get("mia_eval_nonmem_loader", None),
+                        # 把 retrain 基线用时传给 fast-FU 以输出 Speedup
+                        retrain_time_sec=locals().get("t_retrain_sec", None))
+            print(">>> fast-fU run finished.")
+
 
         # ----------------- FedFIM -----------------
     if "fedfim" in args.baselines:

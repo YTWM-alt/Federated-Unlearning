@@ -54,7 +54,7 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --num_participating_clients -1 \
             --seed $SEED \
             --num_local_epochs $EPOCHS \
-            --baselines pga \
+            --baselines fast_fu \
             --fair_rank_k $RANK_K \
             --fair_tau_mode $TAU_MODE \
             --fair_fisher_batches $FISHER_B \
@@ -65,6 +65,8 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --full_training_dir $FULL_TRAIN_DIR \
             --retraining_dir $RETRAIN_MODEL_PATH \
             --apply_membership_inference true \
+            --mia_verbose true \
+            --mia_scope all \
             --fair_auto_tune_all true \
             --fair_auto_erase true \
 
