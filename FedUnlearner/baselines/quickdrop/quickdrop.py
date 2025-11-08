@@ -13,6 +13,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from FedUnlearner.models import AllCNN, ResNet18, SmallCNN
 from FedUnlearner.utils import get_labels_from_dataset  # 按类统计/索引  :contentReference[oaicite:3]{index=3}
 
+import os
 def _build_model(args, num_classes: int) -> nn.Module:
     """与 main.py 中保持同构：根据 args.model/dataset 构建模型"""
     if args.model == 'allcnn':
@@ -92,6 +93,7 @@ def _distill_dc(
     device: torch.device,
     global_model: nn.Module,
     cid: int = -1,               # 仅用于日志打印
+    round_idx: int = -1,         # 新增：所在联邦轮次（从0计）
 ) -> Tuple[TensorDataset, torch.Tensor, torch.Tensor]:
     """
     DC/gradient-matching 蒸馏：
@@ -186,7 +188,11 @@ def _distill_dc(
                 loss_val = float(L.item())
             except Exception:
                 loss_val = float('nan')
-            print(f"[QuickDrop][cid={cid}] it={it+1}/{args.qd_syn_steps}  match_loss={loss_val:.4f}  Δt={elapsed:.1f}s")
+            _r_cur = (round_idx + 1) if (round_idx is not None and round_idx >= 0) else None
+            _r_tot = getattr(args, 'num_training_iterations', None)
+            prefix = (f"[QuickDrop][round={_r_cur}/{_r_tot}][cid={cid}]" if (_r_cur is not None and _r_tot is not None)
+                      else f"[QuickDrop][cid={cid}]")
+            print(f"{prefix} it={it+1}/{args.qd_syn_steps}  match_loss={loss_val:.4f}  Δt={elapsed:.1f}s")
             t0 = time.time()
             if torch.cuda.is_available() and str(device).startswith("cuda"):
                 torch.cuda.synchronize()
@@ -267,11 +273,15 @@ def run_quickdrop(
     exp_root = os.path.abspath(os.path.join(args.exp_path, args.exp_name))
     out_root = os.path.join(exp_root, "quickdrop")
     os.makedirs(out_root, exist_ok=True)
-    if args.qd_save_affine:
-        affine_root = os.path.join(exp_root, args.qd_affine_dir)
-        os.makedirs(affine_root, exist_ok=True)
+    # 无论是否选择另存“按轮产物”，都需要一个缓存目录来做复用
+    affine_root = os.path.join(exp_root, args.qd_affine_dir)
+    os.makedirs(affine_root, exist_ok=True)
 
     for round_idx in range(int(args.num_training_iterations)):
+        # 轮次头部打印：更直观地看到从上一轮的 cid=19 回到了下一轮的开头
+        _n_cli = (len(clientwise_dataloaders) if (not args.num_participating_clients or args.num_participating_clients <= 0)
+                  else min(args.num_participating_clients, len(clientwise_dataloaders)))
+        print(f"\n[QuickDrop] >>> Round {round_idx+1}/{int(args.num_training_iterations)} start (clients={_n_cli}) <<<")
         # 所有（或前 num_participating_clients 个）客户端参与
         client_ids = list(clientwise_dataloaders.keys())
         if args.num_participating_clients and args.num_participating_clients > 0:
@@ -281,15 +291,30 @@ def run_quickdrop(
         # === Client loop ===
         for cid in client_ids:
             loader = clientwise_dataloaders[cid]
-            # 先蒸馏得到合成集
-            syn_ds, syn_img, syn_lab = _distill_dc(
-                args=args,
-                client_loader=loader,
-                num_classes=num_classes,
-                device=device,
-                global_model=G,
-                cid=cid,
-            )
+            # ---------- 优先加载缓存，避免重复蒸馏 ----------
+            cache_name = f"cache_client_{cid}_scale{args.qd_scale}.pt"
+            cache_path = os.path.join(affine_root, cache_name)
+            syn_ds = None; syn_img = syn_lab = None
+            if bool(getattr(args, "qd_use_affine_cache", True)) and os.path.isfile(cache_path):
+                blob = torch.load(cache_path, map_location="cpu")
+                syn_img, syn_lab = blob["images"], blob["labels"]
+                syn_ds = TensorDataset(syn_img, syn_lab)
+                print(f"[QuickDrop] load cached affine: {cache_path}  (cid={cid})")
+            else:
+                # 缓存不存在 → 执行一次蒸馏并写入缓存
+                syn_ds, syn_img, syn_lab = _distill_dc(
+                    args=args,
+                    client_loader=loader,
+                    num_classes=num_classes,
+                    device=device,
+                    global_model=G,
+                    cid=cid,
+                    round_idx=round_idx,
+                )
+                if syn_img is not None and bool(getattr(args, "qd_use_affine_cache", True)):
+                    torch.save({"images": syn_img, "labels": syn_lab}, cache_path)
+                    print(f"[QuickDrop] save affine cache: {cache_path}  (cid={cid})")
+ 
             # 可选：落盘合成集，便于复现实验（“affine dataset”）
             if args.qd_save_affine and syn_img is not None:
                 torch.save(
@@ -312,4 +337,5 @@ def run_quickdrop(
     # final
     torch.save(G.state_dict(), os.path.join(out_root, "final_model.pth"))
     info = {"weights_dir": out_root}
-    return G.to("cpu"), info
+    # 保持与调用时一致的设备，避免评测阶段 device 不匹配
+    return G.to(device), info

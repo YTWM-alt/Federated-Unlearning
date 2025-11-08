@@ -137,6 +137,7 @@ def str2bool(v):
 # ——————————————
 
 def get_accuracy_only(model, dataloader, device):
+    model = model.to(device)
     model.eval()
     correct, total = 0, 0
     import torch
@@ -348,11 +349,11 @@ parser.add_argument('--fast_theta', type=float, default=1.0,
     help='fast-fU: theta scaling for unlearning term')
 
 # ---------- QuickDrop 超参（贴近原实现命名/语义） ----------
-parser.add_argument('--qd_scale', type=float, default=0.01,
+parser.add_argument('--qd_scale', type=float, default=0.5,
     help='QuickDrop: 每类合成样本比例（如 0.01 表示每类约 1%）')
 parser.add_argument('--qd_method', type=str, default='dc', choices=['dc'],
     help='QuickDrop: 蒸馏方法（此实现提供 DC/gradient matching 变体）')
-parser.add_argument('--qd_syn_steps', type=int, default=10,
+parser.add_argument('--qd_syn_steps', type=int, default=500,
     help='QuickDrop: 蒸馏外循环步数（优化合成图像）')
 parser.add_argument('--qd_lr_img', type=float, default=0.1,
     help='QuickDrop: 合成图像的学习率')
@@ -366,9 +367,12 @@ parser.add_argument('--qd_save_affine', type=str2bool, default=False,
     help='QuickDrop: 是否保存各客户端合成（affine/synthetic）数据张量')
 parser.add_argument('--qd_affine_dir', type=str, default='quickdrop_affine',
     help='QuickDrop: 合成数据保存目录（位于 experiments/exp_name 下）')
-parser.add_argument('--qd_log_interval', type=int, default=10,
+parser.add_argument('--qd_log_interval', type=int, default=50,
     help='QuickDrop: 蒸馏外循环日志步长（每多少步打印一次进度）')
 
+# 若已存在合成集缓存，则直接加载并跳过蒸馏（默认开启）
+parser.add_argument('--qd_use_affine_cache', type=str2bool, default=True,
+    help='QuickDrop: 发现缓存则复用合成集，避免重复蒸馏')
 
 
 
