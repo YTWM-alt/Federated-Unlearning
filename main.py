@@ -20,10 +20,10 @@ from FedUnlearner.utils import (
 )
 from FedUnlearner.data_utils import get_dataset, create_dirichlet_data_distribution, create_iid_data_distribution
 from FedUnlearner.fed_learn import fed_train, get_performance
-from FedUnlearner.unlearn import unlearn as unlearn_ours
 from FedUnlearner.models import AllCNN, ResNet18, SmallCNN
 from FedUnlearner.attacks.backdoor import create_backdoor_dataset, evaluate_backdoor_attack
 from FedUnlearner.baselines import run_pga, run_fed_eraser
+from FedUnlearner.baselines import run_conda
 from FedUnlearner.attacks.mia import train_attack_model, evaluate_mia_attack
 from FedUnlearner.attacks.poisoning import create_poisoning_dataset, evaluate_poisoning_attack
 
@@ -337,7 +337,7 @@ parser.add_argument('--num_participating_clients', type=int, default=-1, help='n
 
 # baslines
 parser.add_argument('--baselines', type=str, nargs="*", default=[], 
-    choices=['pga', 'fed_eraser', 'fedfim', 'fair_vue', 'fast_fu', 'quickdrop'],
+    choices=['pga', 'fed_eraser', 'fedfim', 'fair_vue', 'fast_fu', 'quickdrop', 'conda'],
     help='baseline methods for unlearning')
 
 # ---------- fast-fU 超参（与原实现同名语义） ----------
@@ -453,6 +453,11 @@ parser.add_argument('--dampening_upper_bound', type=float,
                     default=0.5, help='dampening upper bound')
 parser.add_argument('--ratio_cutoff', type=float,
                     default=0.5, help='ratio cutoff')
+# —— CONDA 额外安全阈值
+parser.add_argument('--conda_lower_bound', type=float, default=0.6,
+                    help='CONDA: 乘子下界（避免把权重乘成接近 0）')
+parser.add_argument('--conda_eps', type=float, default=1e-6,
+                    help='CONDA: 防 0 除的数值稳定项')
 parser.add_argument('--device', type=str, default='cpu',
                     choices=["cpu", "cuda"], help='device name')
 parser.add_argument('--seed', type=int, default=None, help='random seed')
@@ -520,8 +525,6 @@ if __name__ == "__main__":
     # 将开关传递给 mia.py（用环境变量最省事）
     import os as _os
     _os.environ["MIA_VERBOSE"] = "1" if args.mia_verbose else "0"
-    # ---- 旧版 Legacy-Unlearn 总开关（默认关）----
-    RUN_LEGACY_UNLEARN = False
     weights_path = os.path.abspath(os.path.join(args.exp_path, args.exp_name))
     
     # === 两份日志路径（时间命名 + 参数命名） ===
@@ -1837,7 +1840,70 @@ if __name__ == "__main__":
             # 供后续可能的二次评测使用
             unlearned_quickdrop_model = deepcopy(qd_model)
 
+        elif baseline == 'conda':
+            # === Contribution Dampening（原 LEGACY_UNLEARN）作为标准 baseline ===
+            _t0 = time.time()
+            model_conda = deepcopy(global_model)
+            # 注意：该 baseline 期望传入实验根路径（其下含 full_training），保持与旧版一致
+            model_conda = run_conda(
+                global_model=model_conda,
+                weights_path=weights_path,
+                forget_clients=args.forget_clients,
+                total_num_clients=len(clientwise_dataloaders),
+                dampening_constant=args.dampening_constant,
+                dampening_upper_bound=args.dampening_upper_bound,
+                ratio_cutoff=args.ratio_cutoff,
+                dampening_lower_bound=args.conda_lower_bound,
+                eps=args.conda_eps,
+                device=args.device
+            )
+            perf = get_performance(
+                model=model_conda,
+                test_dataloader=test_dataloader,
+                clientwise_dataloader=clientwise_dataloaders,
+                num_classes=num_classes,
+                device=args.device
+            )
+            conda_time_sec = time.time() - _t0
+            print(f"[Timing] CONDA time: {conda_time_sec:.2f}s")
+            summary['performance']['after_conda'] = perf
+            if args.verbose:
+                print(f"Performance after conda : {perf}")
 
+            # 攻击评测保持与其他 baseline 一致
+            if args.apply_backdoor:
+                forget_backdoor_conda = evaluate_backdoor_attack(
+                    model=model_conda, backdoor_context=backdoor_context, device=args.device
+                )
+                summary['backdoor_results']['after_conda'] = forget_backdoor_conda
+                if args.verbose:
+                    print(f"Backdoor results after conda : {forget_backdoor_conda}")
+            if args.apply_label_poisoning:
+                forget_poisoning_conda = evaluate_poisoning_attack(
+                    model=model_conda, poisoning_context=poisoning_context, device=args.device
+                )
+                summary['poisoning_results']['after_conda'] = forget_poisoning_conda
+                if args.verbose:
+                    print(f"Poisoning results after conda : {forget_poisoning_conda}")
+
+            # 六项统一指标
+            test_acc_conda    = get_accuracy_only(model_conda, test_dataloader, args.device)
+            target_acc_conda  = get_accuracy_only(model_conda, clientwise_dataloaders[forget_client], args.device)
+            target_loss_conda = eval_ce_loss(model_conda, clientwise_dataloaders[forget_client], args.device)
+            speedup_conda     = (t_retrain_sec / conda_time_sec) if (t_retrain_sec is not None and conda_time_sec > 0) else None
+            angle_conda       = cosine_angle_between_models(model_conda, retrained_global_model) if has_retrain_baseline else None
+            mia_conda = None
+            if args.apply_membership_inference:
+                mia_conda = evaluate_mia_attack(
+                    target_model=deepcopy(model_conda),
+                    attack_model=attack_model,
+                    client_loaders=clientwise_dataloaders,
+                    test_loader=test_dataloader,
+                    dataset=args.dataset,
+                    forget_client_idx=args.forget_clients[0],
+                    device=args.device
+                )
+            print_forgetting_metrics("CONDA", test_acc_conda, target_acc_conda, target_loss_conda, speedup_conda, angle_conda, mia_conda)
         # ----------------- FedFIM -----------------
     if "fedfim" in args.baselines:
         from FedUnlearner.baselines import run_fedfIM
@@ -1883,51 +1949,14 @@ if __name__ == "__main__":
         print(f"[FedFIM模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
 
 
-    # ============ Legacy Unlearn Baseline（默认不执行） ============
-    if RUN_LEGACY_UNLEARN:
-        unlearned_global_weights = unlearn_ours(global_model=global_model.cpu().state_dict(), forget_clients=args.forget_clients,
-                                                total_num_clients=args.total_num_clients, weights_path=weights_path,
-                                                dampening_constant=args.dampening_constant, dampening_upper_bound=args.dampening_upper_bound,
-                                                ratio_cutoff=args.ratio_cutoff)
-        unlearned_global_model = deepcopy(global_model)
-        unlearned_global_model.load_state_dict(unlearned_global_weights)
-        # check classwise accuracy
-        if RUN_LEGACY_UNLEARN:
-            perf = get_performance(model=unlearned_global_model, test_dataloader=test_dataloader,
-                                clientwise_dataloader=clientwise_dataloaders, num_classes=num_classes,
-                                device=args.device)
-            summary['performance']['after_unlearning'] = perf
-        if args.verbose:
-            print(f"Performance after unlearning : {perf}")
-
-            # ---- 专门测忘却客户端的精度 ----
-            forget_loader = clientwise_dataloaders[forget_client]
-            acc = get_accuracy_only(unlearned_global_model, forget_loader, args.device)
-            print(f"[Unlearn模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
 
 
-        # check backdoor on unlearned model
-        if args.apply_backdoor:
-            if RUN_LEGACY_UNLEARN:
-                forget_backdoor_attacks = evaluate_backdoor_attack(model=unlearned_global_model, backdoor_context=backdoor_context,
-                                                                device=args.device)
-                summary['backdoor_results']['after_unlearning'] = forget_backdoor_attacks
 
-            if args.verbose:
-                print(
-                    f"Backdoor results after unlearning : {forget_backdoor_attacks}")
 
-        # check poisoning on unlearned model
-        if args.apply_label_poisoning:
-            if RUN_LEGACY_UNLEARN:
-                forget_poisoning_attacks = evaluate_poisoning_attack(model=unlearned_global_model,
-                                                                    poisoning_context=poisoning_context,
-                                                                    device=args.device)
-                summary['poisoning_results']['after_unlearning'] = forget_poisoning_attacks
 
-            if args.verbose:
-                print(
-                    f"Poisoning results after unlearning : {forget_poisoning_attacks}")
+ 
+
+
     # check mia precision and recall on all model
     summary['mia_attack'] = {}
     if args.apply_membership_inference and args.mia_scope=='all':
@@ -1942,22 +1971,6 @@ if __name__ == "__main__":
                 pass
             _gc.collect()
 
-        if RUN_LEGACY_UNLEARN:
-            print("[MIA] 开始对 after_unlearning 模型执行成员推断...")
-            _t0=_t.time()
-            unlearning_mia_result = evaluate_mia_attack(target_model=deepcopy(unlearned_global_model),
-                                                        attack_model=attack_model,
-                                                        client_loaders=clientwise_dataloaders,
-                                                        test_loader=test_dataloader,
-                                                        dataset=args.dataset,
-                                                        forget_client_idx=args.forget_clients[0],
-                                                        device=args.device)
-            print(f"[MIA] after_unlearning 完成，用时 {(_t.time()-_t0):.2f}s")
-            summary['mia_attack']['after_unlearning'] = _shrink_mia_result(unlearning_mia_result)
-            _sync_cuda()
-            if args.verbose:
-                print(
-                    f"MIA results after unlearning : {unlearning_mia_result}")
         if not args.skip_retraining:
             print("[MIA] 开始对 retraining 模型执行成员推断...")
             _t0=_t.time()
