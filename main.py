@@ -306,6 +306,70 @@ def _shrink_mia_result(res):
         'f1': _to_float(f1),
     }
 
+# ---- Memory/Space overhead helpers (CPU & GPU peak during a block) ----
+try:
+    import resource as _resource  # not available on Windows
+except Exception:
+    _resource = None
+
+class PeakMem:
+    def __init__(self, device):
+        self.device = device
+        self.cpu_peak_mb = None
+        self.gpu_peak_mb = None
+        self._base_ru = None
+        self._is_cuda = False
+    def __enter__(self):
+        import torch, gc as _gc
+        self._is_cuda = torch.cuda.is_available() and str(self.device).startswith("cuda")
+        _gc.collect()
+        if self._is_cuda:
+            try:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(torch.device(self.device))
+            except Exception:
+                pass
+        if _resource is not None:
+            try:
+                self._base_ru = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+            except Exception:
+                self._base_ru = None
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        import sys as _sys
+        import torch
+        # CPU peak (delta ru_maxrss)
+        if (_resource is not None) and (self._base_ru is not None):
+            try:
+                ru1 = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+                delta = max(0, ru1 - self._base_ru)
+                # Linux returns KB; macOS returns bytes
+                bytes_used = delta if _sys.platform == "darwin" else (delta * 1024)
+                self.cpu_peak_mb = bytes_used / (1024 * 1024)
+            except Exception:
+                self.cpu_peak_mb = None
+        # GPU peak (allocated)
+        if self._is_cuda:
+            try:
+                torch.cuda.synchronize()
+                peak = torch.cuda.max_memory_allocated(torch.device(self.device))
+                self.gpu_peak_mb = peak / (1024 * 1024)
+            except Exception:
+                self.gpu_peak_mb = None
+        return False
+
+def _print_mem_overhead(label: str, pm: PeakMem, summary: dict):
+    cpu_str = f"{pm.cpu_peak_mb:.2f} MB" if pm.cpu_peak_mb is not None else "NA"
+    gpu_str = f"{pm.gpu_peak_mb:.2f} MB" if pm.gpu_peak_mb is not None else "NA"
+    print(f"[Memory] {label}: peak CPU={cpu_str}; peak GPU={gpu_str}")
+    try:
+        summary.setdefault('space_overhead', {})[label] = {
+            'cpu_peak_mb': pm.cpu_peak_mb,
+            'gpu_peak_mb': pm.gpu_peak_mb
+        }
+    except Exception:
+        pass
 
 # create argument parser
 parser = argparse.ArgumentParser(description='FedUnlearner')
@@ -340,12 +404,26 @@ parser.add_argument('--baselines', type=str, nargs="*", default=[],
     choices=['pga', 'fed_eraser', 'fedfim', 'fair_vue', 'fast_fu', 'quickdrop', 'conda'],
     help='baseline methods for unlearning')
 
+# ===== FedEraser 可调强度参数 =====
+parser.add_argument('--fe_strength', type=float, default=1.5,
+    help='FedEraser: overall multiplier on geometry step size')
+parser.add_argument('--fe_scale_from', type=str, default='old', choices=['old','new','none'],
+    help='FedEraser: scale source; old=||Σ(oldCM-oldGM)||, new=||Σ(newCM-oldCM)||, none=1')
+parser.add_argument('--fe_normalize', type=str2bool, default=True,
+    help='FedEraser: divide by direction L2 norm')
+parser.add_argument('--fe_max_step_ratio', type=float, default=0.10,
+    help='FedEraser: clip per-layer step norm to ratio * ||newGM[layer]||')
+parser.add_argument('--fe_apply_regex', type=str, default=None,
+    help='FedEraser: only apply to params whose name matches this regex (e.g., "fc|classifier")')
+parser.add_argument('--fe_eps', type=float, default=1e-12,
+    help='FedEraser: small epsilon for numeric stability')
+
 # ---------- fast-fU 超参（与原实现同名语义） ----------
 parser.add_argument('--fast_expected_saving', type=int, default=5,
     help='fast-fU: expected number of saved client updates (m)')
-parser.add_argument('--fast_alpha', type=float, default=0.5,
+parser.add_argument('--fast_alpha', type=float, default=0.55,
     help='fast-fU: alpha coefficient')
-parser.add_argument('--fast_theta', type=float, default=1.0,
+parser.add_argument('--fast_theta', type=float, default=2.0,
     help='fast-fU: theta scaling for unlearning term')
 
 # ---------- QuickDrop 超参（贴近原实现命名/语义） ----------
@@ -353,13 +431,13 @@ parser.add_argument('--qd_scale', type=float, default=0.5,
     help='QuickDrop: 每类合成样本比例（如 0.01 表示每类约 1%）')
 parser.add_argument('--qd_method', type=str, default='dc', choices=['dc'],
     help='QuickDrop: 蒸馏方法（此实现提供 DC/gradient matching 变体）')
-parser.add_argument('--qd_syn_steps', type=int, default=500,
+parser.add_argument('--qd_syn_steps', type=int, default=25,
     help='QuickDrop: 蒸馏外循环步数（优化合成图像）')
-parser.add_argument('--qd_lr_img', type=float, default=0.1,
+parser.add_argument('--qd_lr_img', type=float, default=0.05,
     help='QuickDrop: 合成图像的学习率')
-parser.add_argument('--qd_batch_real', type=int, default=256,
+parser.add_argument('--qd_batch_real', type=int, default=128,
     help='QuickDrop: 真实批大小（用来计算目标梯度）')
-parser.add_argument('--qd_batch_syn', type=int, default=256,
+parser.add_argument('--qd_batch_syn', type=int, default=128,
     help='QuickDrop: 合成批大小（用来计算匹配梯度）')
 parser.add_argument('--qd_local_epochs', type=int, default=None,
     help='QuickDrop: 本地训练轮数（默认沿用 num_local_epochs）')
@@ -367,7 +445,7 @@ parser.add_argument('--qd_save_affine', type=str2bool, default=False,
     help='QuickDrop: 是否保存各客户端合成（affine/synthetic）数据张量')
 parser.add_argument('--qd_affine_dir', type=str, default='quickdrop_affine',
     help='QuickDrop: 合成数据保存目录（位于 experiments/exp_name 下）')
-parser.add_argument('--qd_log_interval', type=int, default=50,
+parser.add_argument('--qd_log_interval', type=int, default=25,
     help='QuickDrop: 蒸馏外循环日志步长（每多少步打印一次进度）')
 
 # 若已存在合成集缓存，则直接加载并跳过蒸馏（默认开启）
@@ -490,6 +568,8 @@ parser.add_argument("--finetune_lr", type=float, default=1e-3)
 parser.add_argument("--finetune_wd", type=float, default=0.0)
 parser.add_argument("--global_weight", type=str, default="")
 parser.add_argument("--output_weight_path", type=str, default="")
+
+
 
 
 # ==== HEAL / 模型治疗参数 ====
@@ -1133,6 +1213,7 @@ if __name__ == "__main__":
         if baseline == 'pga':
             _t0 = time.time()
             global_model_pga = deepcopy(global_model)
+            _pm_pga = PeakMem(args.device); _pm_pga.__enter__()
             unlearned_pga_model = run_pga(global_model=global_model_pga,
                                           weights_path=train_path,
                                           clientwise_dataloaders=clientwise_dataloaders,
@@ -1195,9 +1276,12 @@ if __name__ == "__main__":
                     device=args.device
                 )
             print_forgetting_metrics("PGA", test_acc_pga, target_acc_pga, target_loss_pga, speedup_pga, angle_pga, mia_pga)
+            _pm_pga.__exit__(None, None, None)
+            _print_mem_overhead("PGA", _pm_pga, summary)
         elif baseline == 'fed_eraser':
             _t0 = time.time()
             global_model_federaser = deepcopy(global_model)
+            _pm_fe = PeakMem(args.device); _pm_fe.__enter__()
             unlearned_federaser_model = run_fed_eraser(global_model=global_model_federaser,
                                                        weights_path=train_path,
                                                        clientwise_dataloaders=clientwise_dataloaders,
@@ -1209,7 +1293,14 @@ if __name__ == "__main__":
                                                        optimizer_name=args.optimizer,
                                                        local_cali_round=1,
                                                        num_unlearn_rounds=1,
-                                                       num_post_training_rounds=1)
+                                                       num_post_training_rounds=1,
+                                                       # 透传强度参数
+                                                       fe_strength=args.fe_strength,
+                                                       fe_scale_from=args.fe_scale_from,
+                                                       fe_normalize=args.fe_normalize,
+                                                       fe_max_step_ratio=args.fe_max_step_ratio,
+                                                       fe_apply_regex=args.fe_apply_regex,
+                                                       fe_eps=args.fe_eps)
             perf = get_performance(model=unlearned_federaser_model, test_dataloader=test_dataloader,
                                    clientwise_dataloader=clientwise_dataloaders, num_classes=num_classes,
                                    device=args.device)
@@ -1257,11 +1348,14 @@ if __name__ == "__main__":
                     eval_nonmem_loader=mia_eval_nonmem_loader
                 )
             print_forgetting_metrics("FedEraser", test_acc_fe, target_acc_fe, target_loss_fe, speedup_fe, angle_fe, mia_fe)
+            _pm_fe.__exit__(None, None, None)
+            _print_mem_overhead("FedEraser", _pm_fe, summary)
         elif baseline == 'fair_vue':
             
             # ---- FAIR-VUE（按轮）----
             print(">>> Running FAIR-VUE (round-wise)...")
             _t0 = time.time()
+            _pm_fair = PeakMem(args.device); _pm_fair.__enter__()
             fair_model = deepcopy(global_model).to(args.device)
             fair_model.eval()
             # —— 参与子空间的参数集合：优先分类头，其次 layer4，兼容多种命名
@@ -1719,6 +1813,8 @@ if __name__ == "__main__":
                 angle_deg=angle_fair,
                 mia_result=mia_fair
             )
+            _pm_fair.__exit__(None, None, None)
+            _print_mem_overhead("FAIR-VUE", _pm_fair, summary)
             # —— 关键：清理 MIA 大对象并同步 CUDA，避免后续卡住 —— 
             try:
                 import torch, gc
@@ -1790,6 +1886,7 @@ if __name__ == "__main__":
             if args.verbose:
                 print(f">>> fast-fU config: attackers={args.attacker}, path='{fv_train_path}'")
             # call runner — 传入 attack_model 与 eval_nonmem_loader，让 fast-fU 分支内也能跑 MIA（与 PGA 一致）
+            _pm_ff = PeakMem(args.device); _pm_ff.__enter__()
             run_fast_fu(args=args,
                         clientwise_dataloaders=clientwise_dataloaders,
                         train_path=fv_train_path,
@@ -1801,12 +1898,15 @@ if __name__ == "__main__":
                         # 把 retrain 基线用时传给 fast-FU 以输出 Speedup
                         retrain_time_sec=locals().get("t_retrain_sec", None))
             print(">>> fast-fU run finished.")
+            _pm_ff.__exit__(None, None, None)
+            _print_mem_overhead("fast-fU", _pm_ff, summary)
 
         elif baseline == 'quickdrop':
             # ---- QuickDrop（严格贴近原法的 DC/梯度匹配蒸馏 + 合成集本地更新）----
             from FedUnlearner.baselines import run_quickdrop
             print(">>> Running QuickDrop (baseline).")
             _t0 = time.time()
+            _pm_qd = PeakMem(args.device); _pm_qd.__enter__()
             qd_model, qd_info = run_quickdrop(
                 args=args,
                 global_model=deepcopy(global_model),
@@ -1839,13 +1939,16 @@ if __name__ == "__main__":
             print_forgetting_metrics("QuickDrop", test_acc_qd, target_acc_qd, target_loss_qd, speedup_qd, angle_qd, mia_qd)
             # 供后续可能的二次评测使用
             unlearned_quickdrop_model = deepcopy(qd_model)
+            _pm_qd.__exit__(None, None, None)
+            _print_mem_overhead("QuickDrop", _pm_qd, summary)
 
         elif baseline == 'conda':
             # === Contribution Dampening（原 LEGACY_UNLEARN）作为标准 baseline ===
             _t0 = time.time()
             model_conda = deepcopy(global_model)
             # 注意：该 baseline 期望传入实验根路径（其下含 full_training），保持与旧版一致
-            model_conda = run_conda(
+            _pm_conda = PeakMem(args.device); _pm_conda.__enter__()
+            model_conda = run_conda(                
                 global_model=model_conda,
                 weights_path=weights_path,
                 forget_clients=args.forget_clients,
@@ -1904,11 +2007,14 @@ if __name__ == "__main__":
                     device=args.device
                 )
             print_forgetting_metrics("CONDA", test_acc_conda, target_acc_conda, target_loss_conda, speedup_conda, angle_conda, mia_conda)
+            _pm_conda.__exit__(None, None, None)
+            _print_mem_overhead("CONDA", _pm_conda, summary)
         # ----------------- FedFIM -----------------
     if "fedfim" in args.baselines:
         from FedUnlearner.baselines import run_fedfIM
         fedfim_model = deepcopy(global_model)
 
+        _pm_fim = PeakMem(args.device); _pm_fim.__enter__()
         _result = run_fedfIM(
             model=fedfim_model,
             client_loaders=clientwise_dataloaders,
@@ -1947,14 +2053,9 @@ if __name__ == "__main__":
         forget_loader = clientwise_dataloaders[forget_client]
         acc = get_accuracy_only(fedfim_model, forget_loader, args.device)
         print(f"[FedFIM模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
+        _pm_fim.__exit__(None, None, None)
+        _print_mem_overhead("FedFIM", _pm_fim, summary)
 
-
-
-
-
-
-
- 
 
 
     # check mia precision and recall on all model

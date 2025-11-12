@@ -9,7 +9,7 @@ DATASET="cifar100"
 MODEL="resnet18"
 OPTIMIZER="sgd"
 TOTAL_CLIENTS=20
-ITERS=200
+ITERS=1
 DEVICE="cuda"
 LR=0.1
 EPOCHS=1
@@ -54,7 +54,7 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --num_participating_clients -1 \
             --seed $SEED \
             --num_local_epochs $EPOCHS \
-            --baselines conda\
+            --baselines fed_eraser\
             --fair_rank_k $RANK_K \
             --fair_tau_mode $TAU_MODE \
             --fair_fisher_batches $FISHER_B \
@@ -69,7 +69,7 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --mia_scope all \
             --fair_auto_tune_all true \
             --fair_auto_erase true \
-            --ratio_cutoff 0.05 \
+            --ratio_cutoff 0.185 \
             --dampening_constant 0.8 \
             --dampening_upper_bound 0.98 \
             --conda_lower_bound 0.70 \

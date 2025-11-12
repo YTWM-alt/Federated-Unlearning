@@ -17,7 +17,8 @@ Expected external deps in your repo:
 from __future__ import annotations
 
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
+import re
 from copy import deepcopy
 
 import torch
@@ -36,10 +37,20 @@ def _safe_load(path: str):
     This is backward compatible with older torch versions.
     """
     try:
-        return torch.load(path, map_location="cpu", weights_only=True)
+        obj = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
         # older torch: no 'weights_only'
-        return torch.load(path, map_location="cpu")
+        obj = torch.load(path, map_location="cpu")
+    # 兼容 {'state_dict': ...} / DataParallel 包裹
+    if isinstance(obj, dict):
+        if 'state_dict' in obj and isinstance(obj['state_dict'], dict):
+            obj = obj['state_dict']
+        # 去掉 'module.' 前缀（若有）
+        if all(isinstance(k, str) for k in obj.keys()):
+            needs_strip = any(k.startswith("module.") for k in obj.keys())
+            if needs_strip:
+                obj = {k.replace("module.", "", 1): v for k, v in obj.items()}
+    return obj
 
 
 def _sd_to_device(sd: Dict[str, torch.Tensor], device: torch.device | str) -> Dict[str, torch.Tensor]:
@@ -54,9 +65,14 @@ def _simple_fed_avg(list_params: List[Dict[str, torch.Tensor]]) -> Dict[str, tor
     out: Dict[str, torch.Tensor] = {}
     keys = list_params[0].keys()
     for k in keys:
-        # stack -> mean 更稳；避免 python 累加产生的 dtype/device 不一致
-        stacked = torch.stack([sd[k] for sd in list_params], dim=0)
-        out[k] = stacked.mean(dim=0)
+        tensors = [sd[k] for sd in list_params if k in sd]
+        # 只对浮点/复数做均值；整型/Bool 等保持第一个（典型如 BN 的 num_batches_tracked）
+        if tensors[0].is_floating_point() or tensors[0].is_complex():
+            stacked = torch.stack(tensors, dim=0)
+            out[k] = stacked.mean(dim=0)
+        else:
+            # 保持 dtype 与语义（计数/掩码等不平均）
+            out[k] = tensors[0].clone()
     return out
 
 
@@ -69,9 +85,17 @@ def fed_eraser_one_step(
     global_model_after_forget: Dict[str, torch.Tensor],
     device: torch.device | str,
     eps: float = 1e-12,
+    # ==== 可调遗忘强度开关 ====
+    strength: float = 1.0,                 # 步长强度倍乘
+    scale_from: str = "old",               # {"old","new","none"}
+    normalize: bool = True,                # 是否除以方向范数
+    max_step_ratio: Optional[float] = None,# 步长范数 ≤ ratio * ||newGM[layer]||
+    apply_regex: Optional[str] = None,     # 只对匹配层生效（如 "fc|classifier"）
 ) -> Dict[str, torch.Tensor]:
     """
-    Implements:  newGM_t  +  ||sum_i (oldCM_i - oldGM_t)|| *  (sum_i (newCM_i - newGM_t)) / ||sum_i (newCM_i - newGM_t)||
+    Implements (stable direction):
+        out_t = newGM_t  +  || Σ_i (oldCM_i^{t-1} - oldGM_{t-1}) || *
+                           ( Σ_i (newCM_i^{t}   - oldCM_i^{t-1}) ) / ( || Σ_i (newCM_i^{t} - oldCM_i^{t-1}) || + eps )
 
     All inputs are moved to `device` inside.
     """
@@ -83,21 +107,43 @@ def fed_eraser_one_step(
     newCMs = [_sd_to_device(sd, device) for sd in new_client_models]
 
     out: Dict[str, torch.Tensor] = {}
+    pat = re.compile(apply_regex) if apply_regex else None
 
     # init accumulators
     for layer in newGM.keys():
+        # 层选择：不匹配则保持不动
+        if pat and (pat.search(layer) is None):
+            out[layer] = newGM[layer].clone()
+            continue
         out[layer] = newGM[layer].clone()
-        # sum of deltas
-        delta_old_sum = torch.zeros_like(newGM[layer])
-        delta_new_sum = torch.zeros_like(newGM[layer])
 
+        # Σ(旧增量) & 跨轮方向
+        delta_old_sum   = torch.zeros_like(newGM[layer])
+        cross_round_dir = torch.zeros_like(newGM[layer])  # Σ_i (newCM - oldCM)
         for i in range(len(oldCMs)):
-            delta_old_sum = delta_old_sum + (oldCMs[i][layer] - oldGM[layer])
-            delta_new_sum = delta_new_sum + (newCMs[i][layer] - newGM[layer])
+            delta_old_sum   = delta_old_sum   + (oldCMs[i][layer] - oldGM[layer])
+            cross_round_dir = cross_round_dir + (newCMs[i][layer] - oldCMs[i][layer])
 
-        scale = torch.norm(delta_old_sum)
-        denom = torch.norm(delta_new_sum) + eps
-        step = (scale / denom) * delta_new_sum
+        # 选择尺度来源
+        if scale_from == "old":
+            scale = torch.norm(delta_old_sum)
+        elif scale_from == "new":
+            scale = torch.norm(cross_round_dir)
+        else:  # "none"
+            scale = torch.tensor(1.0, device=newGM[layer].device, dtype=newGM[layer].dtype)
+
+        # 是否对方向做 L2 归一化
+        denom = (torch.norm(cross_round_dir) + eps) if normalize else torch.tensor(1.0, device=newGM[layer].device, dtype=newGM[layer].dtype)
+        step = strength * (scale / denom) * cross_round_dir
+
+        # 可选：按层裁剪步长范数，抑制过冲
+        if (max_step_ratio is not None) and (max_step_ratio > 0):
+            ref = torch.norm(newGM[layer]) + eps
+            max_norm = float(max_step_ratio) * ref
+            s = torch.norm(step)
+            if s > max_norm:
+                step = step * (max_norm / (s + 1e-12))
+
         out[layer] = out[layer] + step
 
     return out
@@ -118,6 +164,13 @@ def run_fed_eraser(
     num_unlearn_rounds: int = 1,
     local_cali_round: int = 1,
     num_post_training_rounds: int = 1,
+    # ==== FedEraser 强度控制参数（传给 one_step）====
+    fe_strength: float = 1.0,
+    fe_scale_from: str = "old",
+    fe_normalize: bool = True,
+    fe_max_step_ratio: Optional[float] = None,
+    fe_apply_regex: Optional[str] = None,
+    fe_eps: float = 1e-12,
 ) -> nn.Module:
     """
     Args:
@@ -125,7 +178,9 @@ def run_fed_eraser(
         forget_clients: list of client ids to forget (this impl assumes single forget client in main)
         num_rounds: should match your training rounds
     """
-    device = torch.device(device)
+    # 同时保留两种形式：字符串给外部API，torch.device给张量计算
+    device_str = device if isinstance(device, str) else device.type
+    device_torch = torch.device(device_str)
 
     # 1) preload all old global models (CPU tensors)
     old_global_models: List[Dict[str, torch.Tensor]] = []
@@ -141,17 +196,31 @@ def run_fed_eraser(
     for rnd in range(num_rounds):
         iter_dir = os.path.join(weights_path, f"iteration_{rnd}")
 
-        old_prev_global = old_global_models[rnd]  # CPU dict
+        # t-1 不存在就跳过（第0轮无几何步）
+        if rnd == 0:
+            continue
+        prev_dir = os.path.join(weights_path, f"iteration_{rnd-1}")
+
+        old_prev_global = old_global_models[rnd-1]  # CPU dict (t-1)
 
         # load old/new client parameters (CPU)
         old_client_parameters: List[Dict[str, torch.Tensor]] = []
         new_client_parameters: List[Dict[str, torch.Tensor]] = []
 
+        # 旧：上一轮（prev_dir）；新：当前轮（iter_dir）
         for cid in chosen_clients:
-            old_client_parameters.append(_safe_load(os.path.join(iter_dir, f"client_{cid}.pth")))
+            old_client_parameters.append(_safe_load(os.path.join(prev_dir, f"client_{cid}.pth")))
 
-        # new_prev_global_model = FedAvg of this round (on device)
-        new_prev_global = average_weights(iter_dir, device=device)
+        # new_prev_global = FedAvg of this round (on device, retain clients only for consistency)
+        # 如果 average_weights(dir) 默认均值全体客户端，这里用 retain 客户端手动均值，避免把被遗忘客户端的权重混进 newGM。
+        tmp_new = []
+        for cid in chosen_clients:
+            tmp_new.append(_safe_load(os.path.join(iter_dir, f"client_{cid}.pth")))
+        # tensors on device for averaging
+        tmp_new_dev = [_sd_to_device(sd, device_torch) for sd in tmp_new]
+        # 简单均值
+        keys = tmp_new_dev[0].keys()
+        new_prev_global = {k: torch.stack([sd[k] for sd in tmp_new_dev], dim=0).mean(dim=0) for k in keys}
 
         for cid in chosen_clients:
             new_client_parameters.append(_safe_load(os.path.join(iter_dir, f"client_{cid}.pth")))
@@ -162,11 +231,17 @@ def run_fed_eraser(
             new_client_models=new_client_parameters,
             global_model_before_forget=old_prev_global,
             global_model_after_forget=new_prev_global,  # already on device in average_weights
-            device=device,
+            device=device_torch,
+            eps=fe_eps,
+            strength=fe_strength,
+            scale_from=fe_scale_from,
+            normalize=fe_normalize,
+            max_step_ratio=fe_max_step_ratio,
+            apply_regex=fe_apply_regex,
         )
 
         # load into model (keep on device for the next stage)
-        unlearned_global_model = deepcopy(global_model).to(device)
+        unlearned_global_model = deepcopy(global_model).to(device_torch)
         unlearned_global_model.load_state_dict(unlearned_sd)
 
         # free cpu tensors early
@@ -183,7 +258,7 @@ def run_fed_eraser(
             cali_lr = lr if lr <= 1e-2 else 1e-2
 
             for cid in tqdm(chosen_clients):
-                client_model = deepcopy(unlearned_global_model).to(device)
+                client_model = deepcopy(unlearned_global_model).to(device_torch)
 
                 if optimizer_name.lower() == "adam":
                     optimizer = torch.optim.Adam(client_model.parameters(), lr=cali_lr)
@@ -200,7 +275,7 @@ def run_fed_eraser(
                     loss_fn=loss_fn,
                     optimizer=optimizer,
                     num_epochs=local_cali_round,
-                    device=device,
+                    device=device_str,
                 )
                 list_params.append(tem_param)
 
