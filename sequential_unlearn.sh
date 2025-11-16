@@ -14,15 +14,15 @@ DEVICE="cuda"
 LR=0.1
 EPOCHS=1
 SEED=42
-FULL_TRAIN_DIR="./experiments/cifar100_resnet18/full_training"
+FULL_TRAIN_DIR="./experiments/cifar100_resnet18_alpha0.5/full_training"
 DISTRIBUTION="dirichlet"
-BASE_EXP_NAME="cifar100_resnet18"
+BASE_EXP_NAME="cifar100_resnet18_alpha0.5"
 
 # 超参数取值范围
-FAIR_RANK_LIST=(16)
+FAIR_RANK_LIST=(64)
 FAIR_TAU_MODES=("mean")
 FAIR_FISHER_BATCHES=(10)
-FAIR_ERASE_SCALES=(0.15)
+FAIR_ERASE_SCALES=(0.0562)
 FORGET_CLIENTS=(0)
 
 # 循环执行实验
@@ -54,7 +54,7 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --num_participating_clients -1 \
             --seed $SEED \
             --num_local_epochs $EPOCHS \
-            --baselines fed_eraser\
+            --baselines fair_vue\
             --fair_rank_k $RANK_K \
             --fair_tau_mode $TAU_MODE \
             --fair_fisher_batches $FISHER_B \
@@ -65,10 +65,10 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --full_training_dir $FULL_TRAIN_DIR \
             --retraining_dir $RETRAIN_MODEL_PATH \
             --apply_membership_inference true \
-            --mia_verbose true \
+            --mia_verbose false \
             --mia_scope all \
-            --fair_auto_tune_all true \
-            --fair_auto_erase true \
+            --fair_auto_tune_all false \
+            --fair_auto_erase false \
             --ratio_cutoff 0.185 \
             --dampening_constant 0.8 \
             --dampening_upper_bound 0.98 \
