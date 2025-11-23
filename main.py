@@ -551,19 +551,28 @@ parser.add_argument('--num_training_iterations', type=int, default=1,
 parser.add_argument('--num_participating_clients', type=int, default=-1, help='number of users participating in trainig, \
                                                                                     -1 if all are required to participate')
 
-# baslines
+# baselines
 parser.add_argument('--baselines', type=str, nargs="*", default=[], 
     choices=['pga', 'fed_eraser', 'fedfim', 'fair_vue', 'fast_fu', 'quickdrop', 'conda'],
     help='baseline methods for unlearning')
 
+# ===== PGA 超参（显式控制遗忘强度） =====
+parser.add_argument('--pga_alpha', type=float, default=0.5,
+    help='PGA: unlearning strength factor (scales both distance threshold and gradient-ascent step size)')
+parser.add_argument('--pga_unlearn_rounds', type=int, default=5,
+    help='PGA: number of gradient-ascent epochs on the forget client data')
+parser.add_argument('--pga_unlearn_lr', type=float, default=0.05,
+    help='PGA: learning rate used during PGA unlearning (default: use --lr)')
+
+
 # ===== FedEraser 可调强度参数 =====
-parser.add_argument('--fe_strength', type=float, default=1.5,
+parser.add_argument('--fe_strength', type=float, default=0.5,
     help='FedEraser: overall multiplier on geometry step size')
 parser.add_argument('--fe_scale_from', type=str, default='old', choices=['old','new','none'],
     help='FedEraser: scale source; old=||Σ(oldCM-oldGM)||, new=||Σ(newCM-oldCM)||, none=1')
 parser.add_argument('--fe_normalize', type=str2bool, default=True,
     help='FedEraser: divide by direction L2 norm')
-parser.add_argument('--fe_max_step_ratio', type=float, default=0.10,
+parser.add_argument('--fe_max_step_ratio', type=float, default=3,
     help='FedEraser: clip per-layer step norm to ratio * ||newGM[layer]||')
 parser.add_argument('--fe_apply_regex', type=str, default=None,
     help='FedEraser: only apply to params whose name matches this regex (e.g., "fc|classifier")')
@@ -573,19 +582,19 @@ parser.add_argument('--fe_eps', type=float, default=1e-12,
 # ---------- fast-fU 超参（与原实现同名语义） ----------
 parser.add_argument('--fast_expected_saving', type=int, default=5,
     help='fast-fU: expected number of saved client updates (m)')
-parser.add_argument('--fast_alpha', type=float, default=0.55,
+parser.add_argument('--fast_alpha', type=float, default=0.37,
     help='fast-fU: alpha coefficient')
 parser.add_argument('--fast_theta', type=float, default=2.0,
     help='fast-fU: theta scaling for unlearning term')
 
 # ---------- QuickDrop 超参（贴近原实现命名/语义） ----------
-parser.add_argument('--qd_scale', type=float, default=0.5,
+parser.add_argument('--qd_scale', type=float, default=0.7,
     help='QuickDrop: 每类合成样本比例（如 0.01 表示每类约 1%）')
 parser.add_argument('--qd_method', type=str, default='dc', choices=['dc'],
     help='QuickDrop: 蒸馏方法（此实现提供 DC/gradient matching 变体）')
 parser.add_argument('--qd_syn_steps', type=int, default=25,
     help='QuickDrop: 蒸馏外循环步数（优化合成图像）')
-parser.add_argument('--qd_lr_img', type=float, default=0.05,
+parser.add_argument('--qd_lr_img', type=float, default=0.075,
     help='QuickDrop: 合成图像的学习率')
 parser.add_argument('--qd_batch_real', type=int, default=128,
     help='QuickDrop: 真实批大小（用来计算目标梯度）')
@@ -696,6 +705,8 @@ parser.add_argument('--seed', type=int, default=None, help='random seed')
 parser.add_argument('--verbose', type=bool, default=True, help='verbose')
 parser.add_argument("--num_workers", type=int, default=0,
                     help="number of workers for data loading")
+parser.add_argument('--conda_weights_path', type=str, default=None,
+                    help='CONDA: 手动指定读取权重的目录（实验根目录或 full_training 目录）')
 
 # create argument parser ...
 parser.add_argument('--skip_training', type=str2bool, default=False,
@@ -807,7 +818,7 @@ if __name__ == "__main__":
 
     if args.client_data_distribution == 'dirichlet':
         clientwise_dataset = create_dirichlet_data_distribution(train_dataset,
-                                                                num_clients=args.total_num_clients, num_classes=num_classes, alpha=0.5)
+                                                                num_clients=args.total_num_clients, num_classes=num_classes, alpha=0.8)
     elif args.client_data_distribution == 'iid':
         clientwise_dataset = create_iid_data_distribution(train_dataset, num_clients=args.total_num_clients,
                                                           num_classes=num_classes)
@@ -1379,11 +1390,13 @@ if __name__ == "__main__":
                                           pretrained=args.pretrained,
                                           num_training_iterations=args.num_training_iterations,
                                           device=args.device,
-                                          lr=args.lr,
+                                          lr=(args.pga_unlearn_lr if args.pga_unlearn_lr is not None else args.lr),
                                           optimizer_name=args.optimizer,
                                           num_local_epochs=args.num_local_epochs,
-                                          num_unlearn_rounds=1,
-                                          num_post_training_rounds=1)
+                                          num_unlearn_rounds=args.pga_unlearn_rounds,
+                                          num_post_training_rounds=1,
+                                          alpha=args.pga_alpha)
+
             perf = get_performance(model=unlearned_pga_model, test_dataloader=test_dataloader,
                                    clientwise_dataloader=clientwise_dataloaders, num_classes=num_classes,
                                    device=args.device)
@@ -1435,6 +1448,20 @@ if __name__ == "__main__":
         elif baseline == 'fed_eraser':
             _t0 = time.time()
             global_model_federaser = deepcopy(global_model)
+            # Debug: 在主流程里先把 FedEraser 关键配置打印出来
+            print(
+                "[FedEraser] main: starting unlearning with "
+                f"forget_clients={args.forget_clients}, "
+                f"total_num_clients={args.total_num_clients}, "
+                f"num_training_iterations={args.num_training_iterations}, "
+                f"lr={args.lr}, optimizer={args.optimizer}, "
+                f"fe_strength={args.fe_strength}, "
+                f"fe_scale_from={args.fe_scale_from}, "
+                f"fe_normalize={args.fe_normalize}, "
+                f"fe_max_step_ratio={args.fe_max_step_ratio}, "
+                f"fe_apply_regex={args.fe_apply_regex}, "
+                f"fe_eps={args.fe_eps}"
+            )
             _pm_fe = PeakMem(args.device); _pm_fe.__enter__()
             unlearned_federaser_model = run_fed_eraser(global_model=global_model_federaser,
                                                        weights_path=train_path,
@@ -2181,9 +2208,13 @@ if __name__ == "__main__":
             model_conda = deepcopy(global_model)
             # 注意：该 baseline 期望传入实验根路径（其下含 full_training），保持与旧版一致
             _pm_conda = PeakMem(args.device); _pm_conda.__enter__()
+
+            # 如果命令行指定了 --conda_weights_path，就优先用；否则退回默认的 weights_path
+            conda_weights_root = args.conda_weights_path or weights_path
+
             model_conda = run_conda(                
                 global_model=model_conda,
-                weights_path=weights_path,
+                weights_path=conda_weights_root, 
                 forget_clients=args.forget_clients,
                 total_num_clients=len(clientwise_dataloaders),
                 dampening_constant=args.dampening_constant,

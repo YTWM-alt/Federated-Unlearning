@@ -98,9 +98,20 @@ def run_conda(global_model: torch.nn.Module,
     - 读取 full_training/initial_model.pth 以及 iteration_*/client_*.pth。
     - 对 global_model.state_dict() 做原地 dampening 并返回模型。
     """
-    training_weights_path = os.path.join(weights_path, "full_training")
-    if not os.path.isdir(training_weights_path):
-        raise RuntimeError(f"[conda] Not found: {training_weights_path}")
+
+    # 先假设 weights_path 是实验根目录
+    candidate1 = os.path.join(weights_path, "full_training")
+    if os.path.isdir(candidate1) and os.path.isfile(os.path.join(candidate1, "initial_model.pth")):
+        # 传的是实验根目录
+        training_weights_path = candidate1
+    elif os.path.isdir(weights_path) and os.path.isfile(os.path.join(weights_path, "initial_model.pth")):
+        # 传进来的就是 full_training 目录
+        training_weights_path = weights_path
+    else:
+        raise RuntimeError(
+            f"[conda] Not found valid training weights dir under: {weights_path} "
+            f"(expect initial_model.pth in it or its full_training/ subdir)"
+        )
 
     # 初始模型（作为“起点权重”，与旧版一致）
     start_model: OrderedDict = torch.load(

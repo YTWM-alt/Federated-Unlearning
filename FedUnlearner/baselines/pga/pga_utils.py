@@ -14,13 +14,13 @@ from .pga_model import get_model
 def get_distance(model1: torch.nn.Module,
                  model2: torch.nn.Module):
     """
-    returns L2 distance between two models
+    returns L2 distance (norm) between two models
     """
     with torch.no_grad():
         model1_flattened = parameters_to_vector(model1.parameters())
         model2_flattened = parameters_to_vector(model2.parameters())
-        distance = torch.square(torch.norm(
-            model1_flattened - model2_flattened))
+        # 使用真正的 L2 范数，后续所有阈值和步长都在同一量纲上
+        distance = torch.norm(model1_flattened - model2_flattened)
     return distance
 
 
@@ -79,7 +79,8 @@ def get_threshold(model_ref: torch.nn.Module,
                                  device=device, dataset=dataset)
         dist_ref_random_lst.append(get_distance(model_ref, random_model).cpu())
 
-    threshold = np.mean(dist_ref_random_lst) / 3
+    # threshold 现在就是 L2 半径，而不是“距离平方”
+    threshold = float(np.mean(dist_ref_random_lst) / 3.0)
     return threshold
 
 
@@ -92,15 +93,16 @@ def unlearn(
     threshold: float,
     optimizer_name: str,
     device: str,
-    clip_grad=1,
-    epochs=1,
-    lr=0.01,
+    clip_grad: float = 1,
+    epochs: int = 1,
+    lr: float = 0.01,
+    alpha: float = 1.0,
 ):
     """
 
     """
 
-    print(f"Performing PGA unlearning for {epochs} rounds")
+    print(f"Performing PGA unlearning for {epochs} rounds (alpha={alpha}, lr={lr})")
     if optimizer_name == 'adam':
         optimizer = torch.optim.Adam(global_model.parameters(), lr=lr)
     elif optimizer_name == 'sgd':
@@ -125,6 +127,10 @@ def unlearn(
             loss = loss_fn(output, target)
 
             optimizer.zero_grad()
+            # 这里只做“标准”的梯度上升，alpha 不再直接缩放梯度，
+            # 而是完全通过 distance_threshold 控制遗忘强度。
+            # 这样可以避免因为梯度裁剪导致的“二极管”现象：
+            # alpha 跨过某个值之后，梯度总被裁剪成同一大小，效果几乎不变。
             loss = -loss  # negate the loss for gradient ascent
             loss.backward()
             if clip_grad > 0:
@@ -132,13 +138,13 @@ def unlearn(
             optimizer.step()
 
             with torch.no_grad():
+                # 投影到以 model_ref 为中心、半径 = threshold 的 L2 球内
                 distance = get_distance(global_model, model_ref)
                 if distance > threshold:
                     dist_vec = parameters_to_vector(
                         global_model.parameters()
                     ) - parameters_to_vector(model_ref.parameters())
-                    dist_vec = dist_vec / \
-                        torch.norm(dist_vec) * np.sqrt(threshold)
+                    dist_vec = dist_vec / torch.norm(dist_vec) * threshold
                     proj_vec = parameters_to_vector(
                         model_ref.parameters()) + dist_vec
                     vector_to_parameters(proj_vec, global_model.parameters())
@@ -147,7 +153,7 @@ def unlearn(
             distance_ref_forget_client = get_distance(
                 global_model, forget_client_model)
 
-            if distance_ref_forget_client > distance_threshold:
+            if distance_ref_forget_client >= distance_threshold:
                 flag = True
                 break
 

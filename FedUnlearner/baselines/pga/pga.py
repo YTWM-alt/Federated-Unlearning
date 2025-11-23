@@ -45,8 +45,9 @@ def run_pga(global_model: torch.nn.Module,
             num_training_iterations: int,
             num_local_epochs: int,
             device: str,
-            num_unlearn_rounds=1,
-            num_post_training_rounds=1,) -> torch.nn.Module:
+            num_unlearn_rounds: int = 1,
+            num_post_training_rounds: int = 1,
+            alpha: float = 1.0,) -> torch.nn.Module:
 
     forget_client_model_path = os.path.join(
         weights_path, f"iteration_{num_training_iterations - 1}", f"client_{forget_client[0]}.pth")
@@ -71,11 +72,16 @@ def run_pga(global_model: torch.nn.Module,
                               device=device)
 
     # —— 自适应的距离阈值（替代之前写死的 2.2）——
-    # 直观含义：要求当前全局模型相对于“参考模型(model_ref)”的状态，
-    # 至少要“远离”到与遗忘客户端最后一轮模型相当的尺度。
-    # 注意：get_distance 返回张量，这里取 float。
-    ALPHA = 0.9  # 0.7/0.85/1.0 三档可切换；建议先 0.85
-    distance_threshold = ALPHA * float(get_distance(model_ref, forget_client_model).item())
+    # alpha 用来控制“离开遗忘客户端”的尺度与强度
+    # 注意：停止条件和阈值现在都用同一对模型(global, forget) 的距离，
+    # 避免原来那种“二极管”式跳变。
+    ALPHA = float(alpha)
+    base_distance = float(get_distance(global_model, forget_client_model).item())
+    # alpha = 0 时：distance_threshold = base_distance（几乎不走）
+    # alpha 变大：允许相对于当前距离再走 alpha 倍，行为更平滑
+    distance_threshold = (1.0 + ALPHA) * base_distance
+    print(f"[PGA] base_distance(global,forget)={base_distance:.6f}, "
+          f"distance_threshold={distance_threshold:.6f}, alpha={ALPHA:.3f}")
 
     unlearned_global_model = unlearn(
         global_model=global_model,
@@ -87,7 +93,9 @@ def run_pga(global_model: torch.nn.Module,
         device=device,
         threshold=threshold,
         clip_grad=5,
-        epochs=num_unlearn_rounds
+        epochs=num_unlearn_rounds,
+        lr=lr,
+        alpha=ALPHA,
     )
 
     total_time = time.time() - start_time

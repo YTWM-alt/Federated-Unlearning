@@ -75,6 +75,54 @@ def _simple_fed_avg(list_params: List[Dict[str, torch.Tensor]]) -> Dict[str, tor
             out[k] = tensors[0].clone()
     return out
 
+@torch.no_grad()
+def _eval_forget_client_basic(
+    model: nn.Module,
+    forget_loader,
+    device: torch.device | str,
+    tag: str = "",
+) -> Dict[str, float]:
+    """Quick evaluation on the *forget* client's dataloader.
+
+    打印遗忘客户端在当前模型下的精度和平均交叉熵，
+    用来区分：几何步 / post-training 分别对遗忘强度和整体性能的影响。
+    """
+    device_str = device if isinstance(device, str) else device.type
+    dev = torch.device(device_str)
+    tmp_model = deepcopy(model).to(dev)
+    tmp_model.eval()
+
+    total = 0
+    correct = 0
+    ce_sum = 0.0
+    loss_fn = nn.CrossEntropyLoss(reduction="sum")
+
+    with torch.no_grad():
+        for batch in forget_loader:
+            # 兼容 (x, y) 或 (x, y, ...) 形式
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                x, y = batch[0], batch[1]
+            else:
+                continue
+
+            x = x.to(dev)
+            y = y.to(dev)
+            logits = tmp_model(x)
+            loss = loss_fn(logits, y)
+            ce_sum += float(loss.item())
+
+            pred = logits.argmax(dim=1)
+            correct += int((pred == y).sum().item())
+            total += int(y.numel())
+
+    acc = correct / total if total > 0 else 0.0
+    ce = ce_sum / total if total > 0 else 0.0
+    print(
+        f"[FedEraser-Eval] {tag}: "
+        f"forget_client_acc={acc:.4f}, forget_client_ce={ce:.4f}, n={total}"
+    )
+    return {"acc": acc, "ce": ce, "n": total}
+
 
 # ---- core one-step geometry -------------------------------------------------
 
@@ -109,12 +157,27 @@ def fed_eraser_one_step(
     out: Dict[str, torch.Tensor] = {}
     pat = re.compile(apply_regex) if apply_regex else None
 
+    # ---- debug accumulators (per one_step call) ----
+    n_total_layers = 0
+    n_moved_layers = 0
+    n_clipped_layers = 0
+    total_norm_old_sq = 0.0
+    total_norm_dir_sq = 0.0
+    total_norm_step_sq = 0.0
+
     # init accumulators
     for layer in newGM.keys():
         # 层选择：不匹配则保持不动
         if pat and (pat.search(layer) is None):
             out[layer] = newGM[layer].clone()
             continue
+
+        # 非浮点 / 非复数参数（一般是计数或掩码，如 num_batches_tracked），
+        # 不做几何步，直接保持不变，避免在 LongTensor 上做 norm/mean 等操作。
+        if (not newGM[layer].is_floating_point()) and (not newGM[layer].is_complex()):
+            out[layer] = newGM[layer].clone()
+            continue
+
         out[layer] = newGM[layer].clone()
 
         # Σ(旧增量) & 跨轮方向
@@ -124,27 +187,74 @@ def fed_eraser_one_step(
             delta_old_sum   = delta_old_sum   + (oldCMs[i][layer] - oldGM[layer])
             cross_round_dir = cross_round_dir + (newCMs[i][layer] - oldCMs[i][layer])
 
+        # 当前层范数
+        norm_old = torch.norm(delta_old_sum)
+        norm_dir = torch.norm(cross_round_dir)
+
         # 选择尺度来源
         if scale_from == "old":
-            scale = torch.norm(delta_old_sum)
+            scale = norm_old
         elif scale_from == "new":
-            scale = torch.norm(cross_round_dir)
+            scale = norm_dir
         else:  # "none"
             scale = torch.tensor(1.0, device=newGM[layer].device, dtype=newGM[layer].dtype)
 
         # 是否对方向做 L2 归一化
-        denom = (torch.norm(cross_round_dir) + eps) if normalize else torch.tensor(1.0, device=newGM[layer].device, dtype=newGM[layer].dtype)
+        denom = (torch.norm(cross_round_dir) + eps) if normalize else torch.tensor(
+            1.0, device=newGM[layer].device, dtype=newGM[layer].dtype
+        )
         step = strength * (scale / denom) * cross_round_dir
+        step_norm_before = torch.norm(step)
 
         # 可选：按层裁剪步长范数，抑制过冲
+        clipped = False
         if (max_step_ratio is not None) and (max_step_ratio > 0):
             ref = torch.norm(newGM[layer]) + eps
             max_norm = float(max_step_ratio) * ref
-            s = torch.norm(step)
-            if s > max_norm:
-                step = step * (max_norm / (s + 1e-12))
+            if step_norm_before > max_norm:
+                step = step * (max_norm / (step_norm_before + 1e-12))
+                clipped = True
+
+        step_norm_after = torch.norm(step)
 
         out[layer] = out[layer] + step
+
+        # ---- debug: per-layer stats ----
+        n_total_layers += 1
+        if step_norm_after.item() > 0:
+            n_moved_layers += 1
+        if clipped:
+            n_clipped_layers += 1
+
+        total_norm_old_sq += float(norm_old.item() ** 2)
+        total_norm_dir_sq += float(norm_dir.item() ** 2)
+        total_norm_step_sq += float(step_norm_after.item() ** 2)
+
+        print(
+            "[FedEraser-OneStep] "
+            f"layer={layer}, "
+            f"||delta_old_sum||={norm_old.item():.4e}, "
+            f"||cross_dir||={norm_dir.item():.4e}, "
+            f"scale={scale.item():.4e}, "
+            f"step_norm_before={step_norm_before.item():.4e}, "
+            f"step_norm_after={step_norm_after.item():.4e}, "
+            f"clipped={clipped}"
+        )
+
+    # ---- debug: global summary for this one_step call ----
+    if n_total_layers > 0:
+        global_norm_old = total_norm_old_sq ** 0.5
+        global_norm_dir = total_norm_dir_sq ** 0.5
+        global_norm_step = total_norm_step_sq ** 0.5
+        print(
+            "[FedEraser-OneStep] summary: "
+            f"layers_total={n_total_layers}, "
+            f"layers_moved={n_moved_layers}, "
+            f"layers_clipped={n_clipped_layers}, "
+            f"global_norm_old={global_norm_old:.4e}, "
+            f"global_norm_dir={global_norm_dir:.4e}, "
+            f"global_norm_step={global_norm_step:.4e}"
+        )
 
     return out
 
@@ -191,15 +301,77 @@ def run_fed_eraser(
     # chosen clients = retain set
     chosen_clients = [i for i in range(num_clients) if i not in forget_clients]
 
+    # 单个被遗忘客户端的 dataloader（这里只支持 1 个 forget client）
+    forget_loader = None
+    forget_client = None
+    if len(forget_clients) > 0:
+        forget_client = forget_clients[0]
+        if forget_client in clientwise_dataloaders:
+            forget_loader = clientwise_dataloaders[forget_client]
+
+    # 打印 FedEraser 关键配置，方便在 log 里快速定位问题
+    print(
+        "[FedEraser] config: "
+        f"num_rounds={num_rounds}, "
+        f"forget_clients={forget_clients}, "
+        f"retain_clients={chosen_clients}, "
+        f"lr={lr}, "
+        f"num_unlearn_rounds={num_unlearn_rounds}, "
+        f"local_cali_round={local_cali_round}, "
+        f"num_post_training_rounds={num_post_training_rounds}, "
+        f"fe_strength={fe_strength}, "
+        f"fe_scale_from='{fe_scale_from}', "
+        f"fe_normalize={fe_normalize}, "
+        f"fe_max_step_ratio={fe_max_step_ratio}, "
+        f"fe_apply_regex={fe_apply_regex}, "
+        f"fe_eps={fe_eps}"
+    )
+
+    # 在任何 FedEraser 操作之前，先看一眼原始模型在遗忘客户端上的表现
+    if forget_loader is not None:
+        _eval_forget_client_basic(
+            model=global_model,
+            forget_loader=forget_loader,
+            device=device_torch,
+            tag="before_federaser_forget",
+        )
+
+    # ---- debug: 全局 FedEraser 配置 ----
+    print(
+        "[FedEraser] config: "
+        f"num_rounds={num_rounds}, "
+        f"forget_clients={forget_clients}, "
+        f"retain_clients={chosen_clients}, "
+        f"lr={lr}, "
+        f"num_unlearn_rounds={num_unlearn_rounds}, "
+        f"local_cali_round={local_cali_round}, "
+        f"num_post_training_rounds={num_post_training_rounds}, "
+        f"fe_strength={fe_strength}, "
+        f"fe_scale_from='{fe_scale_from}', "
+        f"fe_normalize={fe_normalize}, "
+        f"fe_max_step_ratio={fe_max_step_ratio}, "
+        f"fe_apply_regex={fe_apply_regex}, "
+        f"fe_eps={fe_eps}"
+    )
+
     # 2) one-step geometry per round, keep the *last* as the final unlearned state
     unlearned_global_model = deepcopy(global_model)
     for rnd in range(num_rounds):
         iter_dir = os.path.join(weights_path, f"iteration_{rnd}")
 
+
+
         # t-1 不存在就跳过（第0轮无几何步）
         if rnd == 0:
+            print(f"[FedEraser] Round {rnd}: skip geometry step (no previous round).")
             continue
         prev_dir = os.path.join(weights_path, f"iteration_{rnd-1}")
+
+        print(
+            "[FedEraser] Round "
+            f"{rnd}: applying geometry step, prev_dir={prev_dir}, iter_dir={iter_dir}, "
+            f"#retain_clients={len(chosen_clients)}"
+        )
 
         old_prev_global = old_global_models[rnd-1]  # CPU dict (t-1)
 
@@ -218,9 +390,34 @@ def run_fed_eraser(
             tmp_new.append(_safe_load(os.path.join(iter_dir, f"client_{cid}.pth")))
         # tensors on device for averaging
         tmp_new_dev = [_sd_to_device(sd, device_torch) for sd in tmp_new]
-        # 简单均值
-        keys = tmp_new_dev[0].keys()
-        new_prev_global = {k: torch.stack([sd[k] for sd in tmp_new_dev], dim=0).mean(dim=0) for k in keys}
+        # 使用安全版 FedAvg：仅对浮点 / 复数做均值，整型 buffer 直接拷贝第一个
+        new_prev_global = _simple_fed_avg(tmp_new_dev)
+
+        # ---- debug: global pre-geometry norms (old vs new) ----
+        old_prev_global_dev = _sd_to_device(old_prev_global, device_torch)
+        total_old_sq = 0.0
+        total_new_sq = 0.0
+        total_diff_sq = 0.0
+        n_g_layers = 0
+        for k, v_new in new_prev_global.items():
+            if (not v_new.is_floating_point()) and (not v_new.is_complex()):
+                continue
+            v_old = old_prev_global_dev[k]
+            diff = v_new - v_old
+            total_old_sq += float(torch.norm(v_old).item() ** 2)
+            total_new_sq += float(torch.norm(v_new).item() ** 2)
+            total_diff_sq += float(torch.norm(diff).item() ** 2)
+            n_g_layers += 1
+        if n_g_layers > 0:
+            print(
+                "[FedEraser] Round "
+                f"{rnd}: pre-geom global norms: "
+                f"||G_old||={(total_old_sq ** 0.5):.4e}, "
+                f"||G_new||={(total_new_sq ** 0.5):.4e}, "
+                f"||G_new-G_old||={(total_diff_sq ** 0.5):.4e}, "
+                f"layers={n_g_layers}"
+            )
+        del old_prev_global_dev
 
         for cid in chosen_clients:
             new_client_parameters.append(_safe_load(os.path.join(iter_dir, f"client_{cid}.pth")))
@@ -240,6 +437,35 @@ def run_fed_eraser(
             apply_regex=fe_apply_regex,
         )
 
+        # ---- debug: global geometry step norms (new vs unlearned) ----
+        total_new_sq = 0.0
+        total_unl_sq = 0.0
+        total_step_sq = 0.0
+        n_step_layers = 0
+        for k, v_new in new_prev_global.items():
+            if (not v_new.is_floating_point()) and (not v_new.is_complex()):
+                continue
+            v_unl = unlearned_sd[k]
+            diff = v_unl - v_new
+            total_new_sq += float(torch.norm(v_new).item() ** 2)
+            total_unl_sq += float(torch.norm(v_unl).item() ** 2)
+            total_step_sq += float(torch.norm(diff).item() ** 2)
+            n_step_layers += 1
+        if n_step_layers > 0:
+            global_new = total_new_sq ** 0.5
+            global_unl = total_unl_sq ** 0.5
+            global_step = total_step_sq ** 0.5
+            rel_step = global_step / (global_new + 1e-12)
+            print(
+                "[FedEraser] Round "
+                f"{rnd}: geometry step norms: "
+                f"||G_new||={global_new:.4e}, "
+                f"||G_unlearned||={global_unl:.4e}, "
+                f"||step||={global_step:.4e}, "
+                f"rel_step={rel_step:.4e}, "
+                f"layers={n_step_layers}"
+            )
+
         # load into model (keep on device for the next stage)
         unlearned_global_model = deepcopy(global_model).to(device_torch)
         unlearned_global_model.load_state_dict(unlearned_sd)
@@ -247,6 +473,16 @@ def run_fed_eraser(
         # free cpu tensors early
         del old_client_parameters, new_client_parameters
         torch.cuda.empty_cache()
+
+
+    # 在做任何 post-training 之前，记录一次“几何步之后”的遗忘客户端表现
+    if forget_loader is not None:
+        _eval_forget_client_basic(
+            model=unlearned_global_model,
+            forget_loader=forget_loader,
+            device=device_torch,
+            tag="after_geometry_forget",
+        )
 
     # 3) optional post-training calibration on retain clients
     if num_post_training_rounds > 0 and len(chosen_clients) > 0:
@@ -283,5 +519,15 @@ def run_fed_eraser(
             global_param = _simple_fed_avg(list_params)
             unlearned_global_model.load_state_dict(global_param)
             torch.cuda.empty_cache()
+
+
+    # post-training 结束后，再看一次遗忘客户端的表现
+    if forget_loader is not None:
+        _eval_forget_client_basic(
+            model=unlearned_global_model,
+            forget_loader=forget_loader,
+            device=device_torch,
+            tag="after_posttraining_forget",
+        )
 
     return unlearned_global_model

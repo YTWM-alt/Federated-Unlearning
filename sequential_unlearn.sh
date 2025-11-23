@@ -9,20 +9,20 @@ DATASET="cifar100"
 MODEL="resnet18"
 OPTIMIZER="sgd"
 TOTAL_CLIENTS=20
-ITERS=1
+ITERS=20
 DEVICE="cuda"
 LR=0.1
 EPOCHS=1
 SEED=42
-FULL_TRAIN_DIR="./experiments/cifar100_resnet18_alpha0.5/full_training"
+FULL_TRAIN_DIR="./experiments/cifar100_resnet18_alpha0.8/full_training"
 DISTRIBUTION="dirichlet"
-BASE_EXP_NAME="cifar100_resnet18_alpha0.5"
+BASE_EXP_NAME="cifar100_resnet18_alpha0.8"
 
 # 超参数取值范围
-FAIR_RANK_LIST=(64)
-FAIR_TAU_MODES=("mean")
+FAIR_RANK_LIST=(200)
+FAIR_TAU_MODES=("median")
 FAIR_FISHER_BATCHES=(10)
-FAIR_ERASE_SCALES=(0.0562)
+FAIR_ERASE_SCALES=(0.065)
 FORGET_CLIENTS=(0)
 
 # 循环执行实验
@@ -66,14 +66,18 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --retraining_dir $RETRAIN_MODEL_PATH \
             --apply_membership_inference true \
             --mia_verbose false \
-            --mia_scope all \
+            --mia_scope none \
             --fair_auto_tune_all false \
             --fair_auto_erase false \
+            --fe_scale_from old \
+            --fe_strength 0.01 \
+            --fe_max_step_ratio 0.5 \
             --ratio_cutoff 0.185 \
             --dampening_constant 0.8 \
             --dampening_upper_bound 0.98 \
             --conda_lower_bound 0.70 \
-            --conda_eps 1e-6
+            --conda_eps 1e-6 \
+            --conda_weights_path ./experiments/cifar100_resnet18_alpha0.8_client0/full_training
 
 
           echo "✅ 完成：client=${CID}, k=${RANK_K}, tau=${TAU_MODE}, fb=${FISHER_B}, es=${ERASE_S}"
