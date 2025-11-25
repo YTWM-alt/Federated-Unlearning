@@ -1842,6 +1842,12 @@ if __name__ == "__main__":
             Q = None
             if V_spec is not None and V_spec.numel() > 0:
                 Q, _ = torch.linalg.qr(V_spec, mode='reduced')  # D_param x r
+            
+            # [Modified] 构造公共子空间的投影矩阵 Q_comm，用于提取“有用知识”
+            Q_comm = None
+            if V_comm is not None and V_comm.numel() > 0:
+                Q_comm, _ = torch.linalg.qr(V_comm, mode='reduced')
+
             if args.fair_vue_debug:
                 print(f"[FV-DBG] Q is None? {Q is None}, "
                     f"Q.shape={(None if Q is None else tuple(Q.shape))}, device={(None if Q is None else Q.device)}")
@@ -1866,6 +1872,8 @@ if __name__ == "__main__":
                 else:
                     spec = torch.zeros_like(d_tar, device=dev)
                 spec_total += spec
+
+                
                 used_rounds += 1
             if args.fair_vue_debug:
                 print(f"[FV-DBG] used_rounds_for_target={used_rounds}, ||spec_total||_2={float(torch.norm(spec_total)):.3e}")
@@ -1992,8 +2000,41 @@ if __name__ == "__main__":
                 print(f"[FV-DBG] erase_scale(chosen)={erase_scale:.4f} (base={base_alpha:.4f}, bounds=[{target_lo:.3f},{target_hi:.3f}])")
 
             # 7) 应用最终擦除到模型参数
+            # [Corrected] 修正后的正交恢复：
+            # 使用“其他客户端”的均值来修复公共子空间，绝对避免使用 target_deltas (防止隐私回流)
+            
+            repair_vec = torch.zeros_like(spec_total)
+            if len(other_deltas_list) > 0 and Q_comm is not None:
+                # 1. 计算保留客户端的均值方向
+                # 注意：other_deltas_list 可能只包含最后一轮，但这代表了模型收敛时的通用梯度方向
+                others_sum = torch.zeros_like(spec_total)
+                for d in other_deltas_list:
+                    others_sum += flatten_by_keys(d, keys_valid, device=dev)
+                others_mean = others_sum / float(len(other_deltas_list))
+
+                # 2. 投影到公共子空间 (仅恢复通用知识)
+                repair_vec = Q_comm @ (Q_comm.T @ others_mean)
+                
+                # 3. [Critical Fix] 能量补偿机制
+                # 自动计算缩放系数，使得恢复的能量与擦除的能量在同一数量级
+                norm_erase  = torch.norm(erase_scale * spec_total)
+                norm_repair = torch.norm(repair_vec)
+                
+                # 目标：恢复约 50% ~ 60% 的被擦除能量，既能修补泛化损伤，又不至于覆盖遗忘效果
+                # 如果 norm_repair 极小(防除零)，则不进行过度放大
+                compensation_factor = 0.0
+                if norm_repair > 1e-6:
+                    compensation_factor = 0.6 * (norm_erase / norm_repair)
+                
+                # 应用动态补偿系数
+                repair_vec = repair_vec * compensation_factor
+
+                if args.fair_vue_debug:
+                    print(f"[FV-DBG] Orthogonal Repair: ||Erase||={norm_erase:.3f}, ||RepairRaw||={norm_repair:.3f} -> Factor={compensation_factor:.3f}")
+
             param_now   = flatten_by_keys(start_sd, param_keys, device=dev)
-            param_new   = param_now - erase_scale * spec_total
+            # repair_vec 已经在上面被动态缩放过了，这里直接加即可
+            param_new   = param_now - erase_scale * spec_total + repair_vec
             new_params  = state_dict_like_by_keys(param_new.to('cpu'), start_sd, param_keys)
             new_sd = dict(start_sd)
             for k in param_keys:
