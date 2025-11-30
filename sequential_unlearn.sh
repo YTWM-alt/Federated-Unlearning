@@ -69,8 +69,9 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --mia_scope none \
             --fair_auto_tune_all false \
             --fair_auto_erase false \
-            --fe_strength 0.001 \
-            --fe_max_step_ratio 0.05 \
+            --fe_scale_from new \
+            --fe_strength 10 \
+            --fe_max_step_ratio 0.39 \
             --ratio_cutoff 0.185 \
             --dampening_constant 0.8 \
             --dampening_upper_bound 0.98 \
