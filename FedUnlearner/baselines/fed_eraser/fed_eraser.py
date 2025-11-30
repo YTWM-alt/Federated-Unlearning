@@ -230,31 +230,6 @@ def fed_eraser_one_step(
         total_norm_dir_sq += float(norm_dir.item() ** 2)
         total_norm_step_sq += float(step_norm_after.item() ** 2)
 
-        print(
-            "[FedEraser-OneStep] "
-            f"layer={layer}, "
-            f"||delta_old_sum||={norm_old.item():.4e}, "
-            f"||cross_dir||={norm_dir.item():.4e}, "
-            f"scale={scale.item():.4e}, "
-            f"step_norm_before={step_norm_before.item():.4e}, "
-            f"step_norm_after={step_norm_after.item():.4e}, "
-            f"clipped={clipped}"
-        )
-
-    # ---- debug: global summary for this one_step call ----
-    if n_total_layers > 0:
-        global_norm_old = total_norm_old_sq ** 0.5
-        global_norm_dir = total_norm_dir_sq ** 0.5
-        global_norm_step = total_norm_step_sq ** 0.5
-        print(
-            "[FedEraser-OneStep] summary: "
-            f"layers_total={n_total_layers}, "
-            f"layers_moved={n_moved_layers}, "
-            f"layers_clipped={n_clipped_layers}, "
-            f"global_norm_old={global_norm_old:.4e}, "
-            f"global_norm_dir={global_norm_dir:.4e}, "
-            f"global_norm_step={global_norm_step:.4e}"
-        )
 
     return out
 
@@ -336,23 +311,6 @@ def run_fed_eraser(
             tag="before_federaser_forget",
         )
 
-    # ---- debug: 全局 FedEraser 配置 ----
-    print(
-        "[FedEraser] config: "
-        f"num_rounds={num_rounds}, "
-        f"forget_clients={forget_clients}, "
-        f"retain_clients={chosen_clients}, "
-        f"lr={lr}, "
-        f"num_unlearn_rounds={num_unlearn_rounds}, "
-        f"local_cali_round={local_cali_round}, "
-        f"num_post_training_rounds={num_post_training_rounds}, "
-        f"fe_strength={fe_strength}, "
-        f"fe_scale_from='{fe_scale_from}', "
-        f"fe_normalize={fe_normalize}, "
-        f"fe_max_step_ratio={fe_max_step_ratio}, "
-        f"fe_apply_regex={fe_apply_regex}, "
-        f"fe_eps={fe_eps}"
-    )
 
     # 2) one-step geometry per round, keep the *last* as the final unlearned state
     unlearned_global_model = deepcopy(global_model)
@@ -367,11 +325,7 @@ def run_fed_eraser(
             continue
         prev_dir = os.path.join(weights_path, f"iteration_{rnd-1}")
 
-        print(
-            "[FedEraser] Round "
-            f"{rnd}: applying geometry step, prev_dir={prev_dir}, iter_dir={iter_dir}, "
-            f"#retain_clients={len(chosen_clients)}"
-        )
+
 
         old_prev_global = old_global_models[rnd-1]  # CPU dict (t-1)
 
@@ -408,15 +362,7 @@ def run_fed_eraser(
             total_new_sq += float(torch.norm(v_new).item() ** 2)
             total_diff_sq += float(torch.norm(diff).item() ** 2)
             n_g_layers += 1
-        if n_g_layers > 0:
-            print(
-                "[FedEraser] Round "
-                f"{rnd}: pre-geom global norms: "
-                f"||G_old||={(total_old_sq ** 0.5):.4e}, "
-                f"||G_new||={(total_new_sq ** 0.5):.4e}, "
-                f"||G_new-G_old||={(total_diff_sq ** 0.5):.4e}, "
-                f"layers={n_g_layers}"
-            )
+
         del old_prev_global_dev
 
         for cid in chosen_clients:
@@ -451,20 +397,7 @@ def run_fed_eraser(
             total_unl_sq += float(torch.norm(v_unl).item() ** 2)
             total_step_sq += float(torch.norm(diff).item() ** 2)
             n_step_layers += 1
-        if n_step_layers > 0:
-            global_new = total_new_sq ** 0.5
-            global_unl = total_unl_sq ** 0.5
-            global_step = total_step_sq ** 0.5
-            rel_step = global_step / (global_new + 1e-12)
-            print(
-                "[FedEraser] Round "
-                f"{rnd}: geometry step norms: "
-                f"||G_new||={global_new:.4e}, "
-                f"||G_unlearned||={global_unl:.4e}, "
-                f"||step||={global_step:.4e}, "
-                f"rel_step={rel_step:.4e}, "
-                f"layers={n_step_layers}"
-            )
+
 
         # load into model (keep on device for the next stage)
         unlearned_global_model = deepcopy(global_model).to(device_torch)

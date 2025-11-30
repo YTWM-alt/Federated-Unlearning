@@ -54,7 +54,7 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --num_participating_clients -1 \
             --seed $SEED \
             --num_local_epochs $EPOCHS \
-            --baselines fair_vue\
+            --baselines fed_eraser\
             --fair_rank_k $RANK_K \
             --fair_tau_mode $TAU_MODE \
             --fair_fisher_batches $FISHER_B \
@@ -69,15 +69,17 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --mia_scope none \
             --fair_auto_tune_all false \
             --fair_auto_erase false \
-            --fe_scale_from old \
-            --fe_strength 0.01 \
-            --fe_max_step_ratio 0.5 \
+            --fe_strength 0.001 \
+            --fe_max_step_ratio 0.05 \
             --ratio_cutoff 0.185 \
             --dampening_constant 0.8 \
             --dampening_upper_bound 0.98 \
             --conda_lower_bound 0.70 \
             --conda_eps 1e-6 \
-            --conda_weights_path ./experiments/cifar100_resnet18_alpha0.8_client0/full_training
+            --conda_weights_path ./experiments/cifar100_resnet18_alpha0.8_client0/full_training \
+            --pga_unlearn_lr 0.00287 \
+            --pga_alpha 0.35 \
+            --pga_unlearn_rounds 5
 
 
           echo "✅ 完成：client=${CID}, k=${RANK_K}, tau=${TAU_MODE}, fb=${FISHER_B}, es=${ERASE_S}"

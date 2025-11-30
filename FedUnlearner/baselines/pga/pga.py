@@ -63,13 +63,17 @@ def run_pga(global_model: torch.nn.Module,
                               num_classes=num_classes,
                               pretrained=pretrained,
                               device=device)
-    # Threshold to which unlearning is to be performed
-    threshold = get_threshold(model_ref=model_ref,
-                              model=model,
-                              dataset=dataset,
-                              num_classes=num_classes,
-                              pretrained=pretrained,
-                              device=device)
+    # [FIX] 不要使用 get_threshold (基于随机模型距离太大)，而是基于当前模型间的距离
+    # base_distance 是 global_model 和 forget_client_model 之间的距离
+    # 我们希望模型在 unlearn 过程中偏离 model_ref 的距离不要超过这个尺度太多
+    base_distance = float(get_distance(global_model, forget_client_model).item())
+    
+    # 设定投影半径。通常取 base_distance 的一部分或倍数。
+    # 经验值：设置为 base_distance 的 0.5 到 1.0 倍比较安全，能保证模型不崩坏。
+    # 如果设得太小，模型变动不了；设得太大，模型会崩。
+    threshold = base_distance * 0.5 
+    
+    print(f"[PGA-FIX] Replaced random-init threshold with dynamic threshold: {threshold:.4f} (base_dist={base_distance:.4f})")
 
     # —— 自适应的距离阈值（替代之前写死的 2.2）——
     # alpha 用来控制“离开遗忘客户端”的尺度与强度
@@ -80,8 +84,14 @@ def run_pga(global_model: torch.nn.Module,
     # alpha = 0 时：distance_threshold = base_distance（几乎不走）
     # alpha 变大：允许相对于当前距离再走 alpha 倍，行为更平滑
     distance_threshold = (1.0 + ALPHA) * base_distance
-    print(f"[PGA] base_distance(global,forget)={base_distance:.6f}, "
-          f"distance_threshold={distance_threshold:.6f}, alpha={ALPHA:.3f}")
+    
+    # [RESTORED] 将控制权交还给 main.py 参数
+    # 之前成功的经验是：Threshold 约为 base_distance 的 0.35 倍
+    # 所以现在 threshold = base_distance * alpha
+    threshold = base_distance * ALPHA
+    
+    print(f"[PGA-CONFIG] Base Dist={base_distance:.4f}, Alpha={ALPHA}, Threshold={threshold:.4f}")
+    print(f"[PGA-CONFIG] Unlearn LR={lr}")
 
     unlearned_global_model = unlearn(
         global_model=global_model,

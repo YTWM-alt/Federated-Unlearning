@@ -106,9 +106,11 @@ def unlearn(
     if optimizer_name == 'adam':
         optimizer = torch.optim.Adam(global_model.parameters(), lr=lr)
     elif optimizer_name == 'sgd':
+        # [FIX] 在遗忘阶段(Ascent)移除 momentum。
+        # 动量会积攒梯度的“惯性”，导致在投影拉回模型后，下一方向依然冲向球外，导致震荡和发散。
         optimizer = torch.optim.SGD(global_model.parameters(),
-                                    lr=lr,
-                                    momentum=0.9)
+                                    lr=lr, 
+                                    momentum=0.0) 
     else:
         raise ValueError(f"Optimizer {optimizer_name} not supported")
 
