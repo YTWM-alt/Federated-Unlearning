@@ -562,7 +562,7 @@ parser.add_argument('--pga_alpha', type=float, default=0.35,
 parser.add_argument('--pga_unlearn_rounds', type=int, default=5,
     help='PGA: number of gradient-ascent epochs on the forget client data')
 parser.add_argument('--pga_unlearn_lr', type=float, default=0.05,
-    help='PGA: learning rate used during PGA unlearning (default: use --lr)')
+    help='核心：PGA: learning rate used during PGA unlearning (default: use --lr)')
 
 
 # ===== FedEraser 可调强度参数 =====
@@ -582,14 +582,14 @@ parser.add_argument('--fe_eps', type=float, default=1e-12,
 # ---------- fast-fU 超参（与原实现同名语义） ----------
 parser.add_argument('--fast_expected_saving', type=int, default=5,
     help='fast-fU: expected number of saved client updates (m)')
-parser.add_argument('--fast_alpha', type=float, default=0.385,
-    help='fast-fU: alpha coefficient')
+parser.add_argument('--fast_alpha', type=float, default=0.625,
+    help='核心：fast-fU: alpha coefficient')
 parser.add_argument('--fast_theta', type=float, default=2.0,
     help='fast-fU: theta scaling for unlearning term')
 
 # ---------- QuickDrop 超参（贴近原实现命名/语义） ----------
-parser.add_argument('--qd_scale', type=float, default=0.7,
-    help='QuickDrop: 每类合成样本比例（如 0.01 表示每类约 1%）')
+parser.add_argument('--qd_scale', type=float, default=0.6151,
+    help='核心：QuickDrop: 每类合成样本比例（如 0.01 表示每类约 1%）')
 parser.add_argument('--qd_method', type=str, default='dc', choices=['dc'],
     help='QuickDrop: 蒸馏方法（此实现提供 DC/gradient matching 变体）')
 parser.add_argument('--qd_syn_steps', type=int, default=25,
