@@ -8,6 +8,8 @@ from tqdm import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import shutil
 import os
+# [新增] 引入 AMP
+from torch.cuda.amp import autocast, GradScaler
 
 import sys
 
@@ -136,17 +138,27 @@ def train_local_model(model: torch.nn.Module, dataloader: torch.utils.data.DataL
     model = model.to(device)
     model.train()
 
+    # [新增] 初始化 Scaler
+    scaler = GradScaler()
 
     for iter in range(num_epochs):
         tqdm_iterator = tqdm(dataloader, desc = f"Epoch: {iter}")
         for images, labels in tqdm_iterator:
             images, labels = images.to(device), labels.to(device)
+            # 优化：非阻塞传输，需在 DataLoader 设置 pin_memory=True
+            # images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
             model.zero_grad()
-            log_probs = model(images)
-            loss = loss_fn(log_probs, labels)
-            loss.backward()
-            optimizer.step()
+            
+            # [修改] 开启混合精度上下文
+            with autocast():
+                log_probs = model(images)
+                loss = loss_fn(log_probs, labels)
+            
+            # [修改] 使用 Scaler 进行反向传播和更新
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             # 余弦调度按 batch 步进，适合本地 epoch 较小的联邦场景
             if scheduler is not None:

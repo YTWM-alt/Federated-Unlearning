@@ -534,7 +534,7 @@ parser.add_argument('--model', type=str, default='allcnn', choices=["allcnn", 'r
 parser.add_argument('--pretrained', type=bool,
                     default=False, help='use pretrained model')
 
-parser.add_argument('--dataset', type=str, default='cifar10', choices=["mnist", "cifar10", "cifar100"],
+parser.add_argument('--dataset', type=str, default='cifar10', choices=["mnist", "cifar10", "cifar100", "tinyimagenet"],
                     help='dataset name')
 parser.add_argument('--optimizer', type=str, default='adam', choices=["sgd", "adam"],
                     help='optimizer name')
