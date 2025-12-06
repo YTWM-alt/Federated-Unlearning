@@ -557,7 +557,7 @@ parser.add_argument('--baselines', type=str, nargs="*", default=[],
     help='baseline methods for unlearning')
 
 # ===== PGA 超参（显式控制遗忘强度） =====
-parser.add_argument('--pga_alpha', type=float, default=0.5,
+parser.add_argument('--pga_alpha', type=float, default=0.35,
     help='PGA: unlearning strength factor (scales both distance threshold and gradient-ascent step size)')
 parser.add_argument('--pga_unlearn_rounds', type=int, default=5,
     help='PGA: number of gradient-ascent epochs on the forget client data')
@@ -566,9 +566,9 @@ parser.add_argument('--pga_unlearn_lr', type=float, default=0.05,
 
 
 # ===== FedEraser 可调强度参数 =====
-parser.add_argument('--fe_strength', type=float, default=0.5,
+parser.add_argument('--fe_strength', type=float, default=10,
     help='FedEraser: overall multiplier on geometry step size')
-parser.add_argument('--fe_scale_from', type=str, default='old', choices=['old','new','none'],
+parser.add_argument('--fe_scale_from', type=str, default='new', choices=['old','new','none'],
     help='FedEraser: scale source; old=||Σ(oldCM-oldGM)||, new=||Σ(newCM-oldCM)||, none=1')
 parser.add_argument('--fe_normalize', type=str2bool, default=True,
     help='FedEraser: divide by direction L2 norm')
@@ -582,7 +582,7 @@ parser.add_argument('--fe_eps', type=float, default=1e-12,
 # ---------- fast-fU 超参（与原实现同名语义） ----------
 parser.add_argument('--fast_expected_saving', type=int, default=5,
     help='fast-fU: expected number of saved client updates (m)')
-parser.add_argument('--fast_alpha', type=float, default=0.37,
+parser.add_argument('--fast_alpha', type=float, default=0.385,
     help='fast-fU: alpha coefficient')
 parser.add_argument('--fast_theta', type=float, default=2.0,
     help='fast-fU: theta scaling for unlearning term')
@@ -818,7 +818,7 @@ if __name__ == "__main__":
 
     if args.client_data_distribution == 'dirichlet':
         clientwise_dataset = create_dirichlet_data_distribution(train_dataset,
-                                                                num_clients=args.total_num_clients, num_classes=num_classes, alpha=0.8)
+                                                                num_clients=args.total_num_clients, num_classes=num_classes, alpha=0.5)
     elif args.client_data_distribution == 'iid':
         clientwise_dataset = create_iid_data_distribution(train_dataset, num_clients=args.total_num_clients,
                                                           num_classes=num_classes)
@@ -879,7 +879,7 @@ if __name__ == "__main__":
     for client_id, client_dataset in clientwise_dataset.items():
         print(f"Creating data loader for client: {client_id}")
         client_dataloader = torch.utils.data.DataLoader(
-            client_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+            client_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
         clientwise_dataloaders[client_id] = client_dataloader
     
     # === 本地 Fisher 端点：客户端持有数据；服务端仅“请求 Fisher”，不触碰原始样本 ===
