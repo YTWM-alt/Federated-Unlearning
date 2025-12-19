@@ -1,6 +1,20 @@
 import torch.nn as nn
 from torchvision.models import resnet18, resnet50
 
+# [新增] 辅助函数：把模型里的 BN 层全换成 GN 层
+def replace_bn_with_gn(module, num_groups=32):
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            # GroupNorm 不需要 running_stats，非常适合 FL
+            # num_channels 必须能被 num_groups 整除，ResNet 的通道通常是 64, 128, 256, 512，都能被 32 整除
+            gn = nn.GroupNorm(num_groups, child.num_features)
+            # 尝试保留一点 BN 的初始化参数（如果有的话）
+            if child.affine:
+                gn.weight.data.copy_(child.weight.data)
+                gn.bias.data.copy_(child.bias.data)
+            setattr(module, name, gn)
+        else:
+            replace_bn_with_gn(child, num_groups)
 
 class SmallCNN(nn.Module):
     """一个很小的卷积网络，适合 MNIST (1×28×28) 和 CIFAR10 (3×32×32)，输入 224 也能跑"""
@@ -130,12 +144,27 @@ class AllCNN(nn.Module):
 class ResNet18(nn.Module):
     def __init__(self, num_channels=3, num_classes=10, pretrained=False):
         super().__init__()
-        base = resnet18(pretrained=pretrained)
-
-        self.base = nn.Sequential(*list(base.children())[:-1])
+        
+        # 1. 加载官方预训练权重 (这是精度的保证)
         if pretrained:
-            for param in self.base.parameters():
-                param.requires_grad = False
+            from torchvision.models import ResNet18_Weights
+            try:
+                # 新版写法
+                base = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+            except:
+                # 旧版兼容
+                base = resnet18(pretrained=True)
+        else:
+            base = resnet18(weights=None)
+
+        # 2. [核心回退] 不修改 conv1，保留预训练的 7x7 卷积
+        # 虽然它 stride=2 会让图片变小，但它保留了提取“边缘/纹理”的核心能力。
+        # Tiny-ImageNet (64x64) -> Conv1 -> (32x32) -> ... -> Final (2x2) -> 足够分类了！
+        
+        # 3. 只需要处理全连接层前的结构
+        self.base = nn.Sequential(*list(base.children())[:-1])
+        
+        # 4. 修改全连接层适配类别数
         in_features = base.fc.in_features
         self.drop = nn.Dropout()
         self.final = nn.Linear(in_features, num_classes)
@@ -145,7 +174,6 @@ class ResNet18(nn.Module):
         x = self.drop(x.view(-1, self.final.in_features))
         x = self.final(x)
         return x
-
 
 class ResNet50(nn.Module):
     def __init__(self, num_classes, pretrained=False):

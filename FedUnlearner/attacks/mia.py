@@ -34,6 +34,7 @@ def train_attack_model(shadow_global_model, shadow_client_loaders, shadow_test_l
     n_class_dict['mnist'] = 10
     n_class_dict['cifar10'] = 10
     n_class_dict['cifar100'] = 100
+    n_class_dict['tinyimagenet'] = 200
 
     N_class = n_class_dict[dataset]
 
@@ -134,6 +135,7 @@ def evaluate_mia_attack(target_model: torch.nn.Module,
     n_class_dict['mnist'] = 10
     n_class_dict['cifar10'] = 10
     n_class_dict['cifar100'] = 100
+    n_class_dict['tinyimagenet'] = 200
 
     N_class = n_class_dict[dataset]
 

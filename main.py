@@ -531,7 +531,7 @@ parser.add_argument("--exp_name", type=str, required=True)
 parser.add_argument("--exp_path", default="./experiments/", type=str)
 parser.add_argument('--model', type=str, default='allcnn', choices=["allcnn", 'resnet18', 'smallcnn'],
                     help='model name')
-parser.add_argument('--pretrained', type=bool,
+parser.add_argument('--pretrained', type=str2bool,
                     default=False, help='use pretrained model')
 
 parser.add_argument('--dataset', type=str, default='cifar10', choices=["mnist", "cifar10", "cifar100", "tinyimagenet"],
@@ -735,6 +735,11 @@ parser.add_argument("--global_weight", type=str, default="")
 parser.add_argument("--output_weight_path", type=str, default="")
 
 
+# ==== 执行阶段控制 (新增) ====
+parser.add_argument('--execution_stage', type=str, default='all',
+                    choices=['all', 'full_training', 'retraining', 'unlearning'],
+                    help='指定运行阶段：all(全流程), full_training(仅训练), retraining(仅重训练), unlearning(仅遗忘)')
+
 
 
 # ==== HEAL / 模型治疗参数 ====
@@ -879,7 +884,8 @@ if __name__ == "__main__":
     for client_id, client_dataset in clientwise_dataset.items():
         print(f"Creating data loader for client: {client_id}")
         client_dataloader = torch.utils.data.DataLoader(
-            client_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+            client_dataset, batch_size=args.batch_size, shuffle=True, 
+            num_workers=args.num_workers, drop_last=True, pin_memory=True, persistent_workers=(args.num_workers > 0))
         clientwise_dataloaders[client_id] = client_dataloader
     
     # === 本地 Fisher 端点：客户端持有数据；服务端仅“请求 Fisher”，不触碰原始样本 ===
@@ -937,7 +943,7 @@ if __name__ == "__main__":
         for cid, loader in clientwise_dataloaders.items()
     }    
     test_dataloader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=args.batch_size*2, shuffle=False, num_workers=args.num_workers)
+        test_dataset, batch_size=args.batch_size*2, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=(args.num_workers > 0))
 
     # train the model
     global_model = None
@@ -965,6 +971,17 @@ if __name__ == "__main__":
 
     retrained_global_model = deepcopy(global_model)
     print(f"Model: {global_model}")
+
+    # =========================================================================
+    #                               阶段 1: Full Training
+    # =========================================================================
+    
+    # 如果处于 'retraining' 或 'unlearning' 阶段，强制跳过训练（变为加载模式）
+    if args.execution_stage in ['retraining', 'unlearning']:
+        args.skip_training = True
+        if args.verbose:
+            print(f"[{args.execution_stage}] 模式：自动跳过 Full Training 训练，尝试加载权重...")
+
     # 原来：
     # train_path = os.path.abspath(os.path.join(weights_path, "full_training"))
     # global_model = fed_train(...)
@@ -1006,24 +1023,34 @@ if __name__ == "__main__":
                                 device=args.device)
 
 
-    perf = get_performance(model=global_model, test_dataloader=test_dataloader, num_classes=num_classes,
-                           clientwise_dataloader=clientwise_dataloaders, device=args.device)
-    summary['performance'] = {}
-    summary['performance']['after_training'] = perf
-    if args.verbose:
-        print(f"Performance after training : {perf}")
+    # [修改] 仅在 'all' 或 'full_training' 阶段才执行 Full Training 的测评
+    if args.execution_stage in ['all', 'full_training']:
+        perf = get_performance(model=global_model, test_dataloader=test_dataloader, num_classes=num_classes,
+                            clientwise_dataloader=clientwise_dataloaders, device=args.device)
+        summary['performance'] = {}
+        summary['performance']['after_training'] = perf
+        if args.verbose:
+            print(f"Performance after training : {perf}")
 
-        forget_loader = clientwise_dataloaders[forget_client]
-        acc = get_accuracy_only(global_model, forget_loader, args.device)
-        print(f"[Training模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
+            forget_loader = clientwise_dataloaders[forget_client]
+            acc = get_accuracy_only(global_model, forget_loader, args.device)
+            print(f"[Training模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
+    else:
+        # 如果跳过测评，给个空字典防止报错
+        summary['performance'] = {}
+        if args.verbose: print("[Skip] 跳过 Full Training 测评")
 
     # === [MIA-INIT] 在任何 evaluate_mia_attack 调用之前，先准备好分割与攻击器 ===
     # 幂等：若后面已有同名对象，这里不会重复构造
     attack_model = locals().get("attack_model", None)
     mia_shadow_nonmem_loader = locals().get("mia_shadow_nonmem_loader", None)
     mia_eval_nonmem_loader   = locals().get("mia_eval_nonmem_loader", None)
+    # [修改] 只有在 'all' 或 'full_training' 阶段才真正去训练 MIA 攻击模型。
+    # 在 'unlearning' 调参阶段，训练攻击模型极其耗时且对调节遗忘参数无帮助，强制跳过。
+    # 如果你需要最终的 MIA 指标，请使用 'all' 模式或手动注释此逻辑。
+    should_train_mia = args.apply_membership_inference and (args.execution_stage in ['all', 'full_training'])
 
-    if args.apply_membership_inference:
+    if should_train_mia:
         # 1) 准备“互斥”的非成员集（shadow/eval）
         if mia_eval_nonmem_loader is None or mia_shadow_nonmem_loader is None:
             from torch.utils.data import random_split, DataLoader as _DL
@@ -1060,11 +1087,15 @@ if __name__ == "__main__":
                 shadow_client_loaders=clientwise_dataloaders,
                 shadow_test_loader=mia_shadow_nonmem_loader,
                 dataset=args.dataset, device=args.device)
+    elif args.execution_stage == 'unlearning' and args.apply_membership_inference:
+        if args.verbose:
+            print(">>> [Unlearning Stage] Skipping MIA Attack Model training to save time (Hyperparameter Tuning Mode).")
 
 
     # ==== 六项指标统一打印（Training 基线）+ MIA：只要 --apply_membership_inference 就默认跑 ====
     mia_training = None
-    if args.apply_membership_inference:
+    # [修改] 仅在 'all' 或 'full_training' 阶段跑
+    if args.apply_membership_inference and args.execution_stage in ['all', 'full_training']:
         # 在“训练好的完整模型”上执行成员推断（评估集非成员与 shadow 非成员互斥）
         mia_training = evaluate_mia_attack(
             target_model=deepcopy(global_model),
@@ -1078,28 +1109,36 @@ if __name__ == "__main__":
         )
 
     # 统一六个指标：测试集准确率、遗忘客户端准确率、遗忘客户端交叉熵、加速比(Training 无)、参数夹角(Training 无)、MIA（三元组）
-    _forget_loader = clientwise_dataloaders[forget_client]
-    test_acc_tr    = get_accuracy_only(global_model, test_dataloader, args.device)
-    target_acc_tr  = get_accuracy_only(global_model, _forget_loader, args.device)
-    target_loss_tr = eval_ce_loss(global_model, _forget_loader, args.device)
-    speedup_tr     = None   # 以 retrain 为基线，此处不计
-    angle_tr       = None   # 需相对 retrain 的夹角，这里留空
-    print_forgetting_metrics(
-        method_name="Training",
-        test_acc=test_acc_tr,
-        target_acc=target_acc_tr,
-        target_loss=target_loss_tr,
-        speedup_x=speedup_tr,
-        angle_deg=angle_tr,
-        mia_result=mia_training
-    )
-    # 清理 MIA 大对象与 CUDA 缓存，避免后续卡住
+    if args.execution_stage in ['all', 'full_training']:
+        _forget_loader = clientwise_dataloaders[forget_client]
+        test_acc_tr    = get_accuracy_only(global_model, test_dataloader, args.device)
+        target_acc_tr  = get_accuracy_only(global_model, _forget_loader, args.device)
+        target_loss_tr = eval_ce_loss(global_model, _forget_loader, args.device)
+        speedup_tr     = None   # 以 retrain 为基线，此处不计
+        angle_tr       = None   # 需相对 retrain 的夹角，这里留空
+        print_forgetting_metrics(
+            method_name="Training",
+            test_acc=test_acc_tr,
+            target_acc=target_acc_tr,
+            target_loss=target_loss_tr,
+            speedup_x=speedup_tr,
+            angle_deg=angle_tr,
+            mia_result=mia_training
+        )
+
+    # [逻辑中断] 如果只跑 full_training，到此结束
+    if args.execution_stage == 'full_training':
+        print(">>> [Finish] Full Training stage completed. Exiting.")
+        sys.exit(0)
+
+    # 清理 MIA 大对象与 CUDA 缓存，避免后续卡住 (通用清理)
     try:
         import torch, gc
         if isinstance(mia_training, dict):
             for k in ['mia_attacker_predictions','mia_attacker_probabilities','predictions','probabilities','scores']:
                 mia_training.pop(k, None)
-        if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+        # [修改] 在 unlearning 阶段跳过强制同步和清理，节省 2-5 秒
+        if args.execution_stage != 'unlearning' and torch.cuda.is_available() and str(args.device).startswith("cuda"):
             torch.cuda.synchronize(); torch.cuda.empty_cache()
         gc.collect()
     except Exception:
@@ -1146,8 +1185,8 @@ if __name__ == "__main__":
             dataset=args.dataset, device=args.device)
     # ---------------------------------------------------------
     # evaluate attack accuracy
-    if args.apply_backdoor:
-
+    # [修改] 仅在 'all' 或 'full_training' 阶段评估初始模型的后门，避免调参时卡顿
+    if args.apply_backdoor and args.execution_stage in ['all', 'full_training']:
         # ------------------------------------------
         # TO-DO: Implement data poisoning and eval from https://arxiv.org/abs/2402.14015 (give credit in code!)
 
@@ -1185,7 +1224,8 @@ if __name__ == "__main__":
                 f"Backdoor results after training : {summary['backdoor_results']}")
 
     # evaluate poisoning accuracy
-    if args.apply_label_poisoning:
+    # [修改] 同上，跳过投毒评估
+    if args.apply_label_poisoning and args.execution_stage in ['all', 'full_training']:
         poisoning_results = evaluate_poisoning_attack(model=global_model,
                                                       poisoning_context=poisoning_context,
                                                       device=args.device)
@@ -1206,16 +1246,30 @@ if __name__ == "__main__":
             print(
                 f"Poisoning results after training : {summary['poisoning_results']}")
 
+    # =========================================================================
+    #                               阶段 2: Retraining
+    # =========================================================================
+    
+
     retrain_path = os.path.join(weights_path, "retraining")
     # train the model on retain data
     retain_clientwise_dataloaders = {key: value for key, value in clientwise_dataloaders.items()
                                      if key not in args.forget_clients}
-    print(f"Retain Client wise Loaders: {retain_clientwise_dataloaders}")
+    # [修改] 注释掉这个打印，防止 Client 很多时刷屏几千行
+    # print(f"Retain Client wise Loaders: {retain_clientwise_dataloaders}")
+
+    # 如果处于 'unlearning' 阶段，我们只需要加载 Retrain 模型算指标，不需要重新跑训练流程
+    if args.execution_stage == 'unlearning':
+        args.skip_retraining = True
+        if args.verbose: print("[unlearning] 模式：跳过 Retraining 训练，将尝试加载基线用于计算 Speedup/Angle")
+
 
     # === 计时：重训基线（供 Speedup 对比） ===
     t_retrain_sec = None
     has_retrain_baseline = False
     if not args.skip_retraining:
+        # 如果当前是 'full_training' 阶段，这里根本不会执行到（上面已 exit）
+        # 所以这里一定是 'all' 或 'retraining'
         _t0 = time.time()
         retrained_global_model = fed_train(num_training_iterations=args.num_training_iterations, test_dataloader=test_dataloader,
                                         clientwise_dataloaders=retain_clientwise_dataloaders,
@@ -1224,24 +1278,26 @@ if __name__ == "__main__":
         t_retrain_sec = time.time() - _t0
         has_retrain_baseline = True
 
-        perf = get_performance(model=retrained_global_model, test_dataloader=test_dataloader,
-                            clientwise_dataloader=clientwise_dataloaders,
-                            num_classes=num_classes, device=args.device)
-        summary['performance']['after_retraining'] = perf
-        if args.verbose:
-            print(f"Performance after retraining : {perf}")
-            print(f"[Timing] Retrain baseline time: {t_retrain_sec:.2f}s" if t_retrain_sec is not None else "[Timing] Retrain baseline time: NA")
-        # evaluate attack accuracy on retrained model
+        if args.execution_stage in ['all', 'retraining']:
+            perf = get_performance(model=retrained_global_model, test_dataloader=test_dataloader,
+                                clientwise_dataloader=clientwise_dataloaders,
+                                num_classes=num_classes, device=args.device)
+            summary['performance']['after_retraining'] = perf
+            if args.verbose:
+                print(f"Performance after retraining : {perf}")
+                print(f"[Timing] Retrain baseline time: {t_retrain_sec:.2f}s" if t_retrain_sec is not None else "[Timing] Retrain baseline time: NA")
+            # evaluate attack accuracy on retrained model
 
-        # ---- 专门测忘却客户端的精度 ----
-            forget_loader = clientwise_dataloaders[forget_client]
-            acc = get_accuracy_only(retrained_global_model, forget_loader, args.device)
-            print(f"[Retrain模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
+            # ---- 专门测忘却客户端的精度 ----
+                forget_loader = clientwise_dataloaders[forget_client]
+                acc = get_accuracy_only(retrained_global_model, forget_loader, args.device)
+                print(f"[Retrain模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
 
 
         # ==== 统一打印（Retrain Baseline）+ MIA：只要开启 MIA 就默认跑 ====
         mia_retrain = None
-        if args.apply_membership_inference:
+        # [修改] 只有在真正跑 Retraining 任务时才测评，Unlearning 阶段即便加载了也不测，省时间
+        if args.apply_membership_inference and args.execution_stage in ['all', 'retraining']:
             mia_retrain = evaluate_mia_attack(
                 target_model=deepcopy(retrained_global_model),
                 attack_model=attack_model,
@@ -1257,7 +1313,9 @@ if __name__ == "__main__":
         target_loss_rt = eval_ce_loss(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
         speedup_rt     = 1.0  # retrain 作为基线
         angle_rt       = 0.0
-        print_forgetting_metrics("Retrain", test_acc_rt, target_acc_rt, target_loss_rt, speedup_rt, angle_rt, mia_retrain)
+        
+        if args.execution_stage in ['all', 'retraining']:
+            print_forgetting_metrics("Retrain", test_acc_rt, target_acc_rt, target_loss_rt, speedup_rt, angle_rt, mia_retrain)
         # 清理大对象
         try:
             import torch, gc
@@ -1304,21 +1362,27 @@ if __name__ == "__main__":
             retrained_global_model.load_state_dict(state_dict)
             has_retrain_baseline = True
             print(f"[Skip-Retrain] 复用重训练基线：{ckpt_path}")
-            # 既然有了基线，也一起评测便于对照
-            perf = get_performance(model=retrained_global_model, test_dataloader=test_dataloader,
-                                   clientwise_dataloader=clientwise_dataloaders,
-                                   num_classes=num_classes, device=args.device)
-            summary['performance']['after_retraining'] = perf
-            if args.verbose:
-                print(f"Performance after (loaded) retraining : {perf}")
-            forget_loader = clientwise_dataloaders[forget_client]
-            acc = get_accuracy_only(retrained_global_model, forget_loader, args.device)
-            print(f"[Retrain(loaded)模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
+            
+            # [修改] 如果是 'unlearning' 阶段，我们只加载权重不算指标，节省时间
+            # 只有 'all' 或 显式 'retraining' (但跳过训练?) 时才测评
+            if args.execution_stage in ['all', 'retraining']:
+                # 既然有了基线，也一起评测便于对照
+                perf = get_performance(model=retrained_global_model, test_dataloader=test_dataloader,
+                                    clientwise_dataloader=clientwise_dataloaders,
+                                    num_classes=num_classes, device=args.device)
+                summary['performance']['after_retraining'] = perf
+                if args.verbose:
+                    print(f"Performance after (loaded) retraining : {perf}")
+                forget_loader = clientwise_dataloaders[forget_client]
+                acc = get_accuracy_only(retrained_global_model, forget_loader, args.device)
+                print(f"[Retrain(loaded)模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
+            
 
 
             # ==== 统一打印（Retrain Baseline，Loaded）+ MIA：只要开启 MIA 就默认跑 ====
             mia_retrain = None
-            if args.apply_membership_inference:
+            # 只有当 attack_model 真正被训练了 (not None) 才跑 MIA
+            if args.apply_membership_inference and attack_model is not None and args.execution_stage in ['all', 'retraining']:
                 mia_retrain = evaluate_mia_attack(
                     target_model=deepcopy(retrained_global_model),
                     attack_model=attack_model,
@@ -1329,12 +1393,15 @@ if __name__ == "__main__":
                     device=args.device,
                     eval_nonmem_loader=mia_eval_nonmem_loader
                 )
-            test_acc_rt    = get_accuracy_only(retrained_global_model, test_dataloader, args.device)
-            target_acc_rt  = get_accuracy_only(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
-            target_loss_rt = eval_ce_loss(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
-            speedup_rt     = None   # 此分支没计时，就打印 NA
-            angle_rt       = 0.0
-            print_forgetting_metrics("Retrain", test_acc_rt, target_acc_rt, target_loss_rt, speedup_rt, angle_rt, mia_retrain)
+            
+            if args.execution_stage in ['all', 'retraining']:
+                test_acc_rt    = get_accuracy_only(retrained_global_model, test_dataloader, args.device)
+                target_acc_rt  = get_accuracy_only(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
+                target_loss_rt = eval_ce_loss(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
+                speedup_rt     = None   # 此分支没计时，就打印 NA
+                angle_rt       = 0.0
+                print_forgetting_metrics("Retrain", test_acc_rt, target_acc_rt, target_loss_rt, speedup_rt, angle_rt, mia_retrain)
+            
             try:
                 import torch, gc
                 if isinstance(mia_retrain, dict):
@@ -1348,13 +1415,21 @@ if __name__ == "__main__":
 
         else:
             if args.verbose:
-                print("[Skip] 跳过重训练基线（--skip_retraining），且未提供 --retraining_dir / --retrained_ckpt")     
+                print("[Skip] 跳过重训练基线（--skip_retraining），且未提供 --retraining_dir / --retrained_ckpt") 
+
+    # [逻辑中断] 如果只跑 retraining，到此结束
+    if args.execution_stage == 'retraining':
+        print(">>> [Finish] Retraining stage completed. Exiting.")
+        sys.exit(0)
 
 
 
 
-    
-    if args.apply_backdoor and not args.skip_retraining:
+    # =========================================================================
+    #                               阶段 3: Unlearning Baselines
+    # =========================================================================
+
+    if args.apply_backdoor and not args.skip_retraining and args.execution_stage in ['all', 'retraining']:
         retrained_backdoor_results = evaluate_backdoor_attack(model=retrained_global_model,
                                                               backdoor_context=backdoor_context, device=args.device)
         summary['backdoor_results']['after_retraining'] = retrained_backdoor_results
@@ -1362,7 +1437,7 @@ if __name__ == "__main__":
             print(
                 f"Backdoor results after retraining : {retrained_backdoor_results}")
 
-    if args.apply_label_poisoning and not args.skip_retraining:
+    if args.apply_label_poisoning and not args.skip_retraining and args.execution_stage in ['all', 'retraining']:
         retrained_poisoning_results = evaluate_poisoning_attack(model=retrained_global_model,
                                                                 poisoning_context=poisoning_context,
                                                                 device=args.device)
@@ -1378,6 +1453,9 @@ if __name__ == "__main__":
         if baseline == 'pga':
             _t0 = time.time()
             global_model_pga = deepcopy(global_model)
+            # [修复] 显式移动到 device，防止 PGA 内部报错
+            global_model_pga = global_model_pga.to(args.device)
+           
             _pm_pga = PeakMem(args.device); _pm_pga.__enter__()
             unlearned_pga_model = run_pga(global_model=global_model_pga,
                                           weights_path=train_path,
@@ -1432,7 +1510,7 @@ if __name__ == "__main__":
             speedup_pga     = (t_retrain_sec / pga_time_sec) if (t_retrain_sec is not None and pga_time_sec > 0) else None
             angle_pga       = cosine_angle_between_models(unlearned_pga_model, retrained_global_model) if has_retrain_baseline else None
             mia_pga = None
-            if args.apply_membership_inference:
+            if args.apply_membership_inference and attack_model is not None:
                 mia_pga = evaluate_mia_attack(
                     target_model=deepcopy(unlearned_pga_model),
                     attack_model=attack_model,

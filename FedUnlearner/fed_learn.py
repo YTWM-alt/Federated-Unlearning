@@ -12,6 +12,7 @@ import os
 from torch.cuda.amp import autocast, GradScaler
 
 import sys
+import math
 
 @typechecked
 def fed_train(num_training_iterations: int, test_dataloader: torch.utils.data.DataLoader, 
@@ -39,21 +40,30 @@ def fed_train(num_training_iterations: int, test_dataloader: torch.utils.data.Da
     best_acc = 0
     patience = 10
     counter = 0
+    
+    # [修复] 记录初始学习率，用于计算全局衰减
+    initial_lr = lr
 
     for iteration in range(num_training_iterations):
         print(f"Global Iteration: {iteration}")
+        
+        # [修复] 计算当前轮次的全局学习率 (Global Cosine Decay)
+        # 随着 iteration 增加，current_lr 会从 initial_lr 平滑下降到 0
+        current_lr = initial_lr * 0.5 * (1 + math.cos(math.pi * iteration / num_training_iterations))
+        
         iteration_weights_path = os.path.join(weights_path, f"iteration_{iteration}")
         os.makedirs(iteration_weights_path, exist_ok = True)
         for client_idx in clients:
-            print(f"Client: {client_idx}")
+            # print(f"Client: {client_idx}") # 减少刷屏
             client_dataloader = clientwise_dataloaders[client_idx]
             client_model = deepcopy(global_model)
             if optimizer_name == 'adam':
-                optimizer = torch.optim.Adam(client_model.parameters(), lr=lr)  # create optimizer
+                # [修复] 使用 current_lr 而不是固定的 lr
+                optimizer = torch.optim.Adam(client_model.parameters(), lr=current_lr)
             elif optimizer_name == 'sgd':
                     optimizer = torch.optim.SGD(
                         client_model.parameters(),
-                        lr=lr,
+                        lr=current_lr, # [修复] 使用 current_lr
                         momentum=0.9,
                         weight_decay=5e-4,
                         nesterov=True
@@ -61,11 +71,13 @@ def fed_train(num_training_iterations: int, test_dataloader: torch.utils.data.Da
             else:
                 raise ValueError(f"Optimizer {optimizer_name} not supported")
             
-            # === Cosine 学习率调度（按 batch 衰减）===
-            # T_max = 本地总步数；eta_min 可按需改成 lr*0.01 或 0.0，这里给个温和下限
-            _steps_per_epoch = max(1, len(client_dataloader))
-            _tmax = max(1, num_local_epochs * _steps_per_epoch)
-            scheduler = CosineAnnealingLR(optimizer, T_max=_tmax, eta_min=lr*0.01)
+            # [建议] 既然已经有了全局衰减，本地训练可以不再使用复杂的调度器，或者仅仅使用简单的 LR
+            # 如果保留本地调度器，它现在会在 current_lr 的基础上微调，而不是从 0.1 开始
+            # 为了稳定性，这里建议移除本地 batch 级调度，纯依靠全局衰减即可，
+            # 或者保留它但要确保 eta_min 是基于 current_lr 的。
+            # 这里我做一个简化：移除本地调度器，防止双重衰减导致后期 LR 过小
+            scheduler = None 
+            
 
             loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
 

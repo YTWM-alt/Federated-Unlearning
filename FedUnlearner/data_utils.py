@@ -14,31 +14,15 @@ class InMemoryImageFolder(Dataset):
     一次性把 ImageFolder 的数据全读进内存，训练时不再读盘。
     """
     def __init__(self, root, transform=None):
-        self.dataset = datasets.ImageFolder(root) # 这里不加 transform，保持原始 PIL
+        self.dataset = datasets.ImageFolder(root, transform=transform)
         self.transform = transform
-        self.images = []
-        self.targets = []
-        
-        print(f"正在预加载 {root} 到内存，请稍候...")
-        for idx in range(len(self.dataset)):
-            img, label = self.dataset[idx]
-            # 这里为了省内存，可以先 resize 到 64x64 再存，或者直接存 PIL
-            # TinyImageNet 本身就是 64x64，直接存 PIL 对象开销很小
-            self.images.append(img) 
-            self.targets.append(label)
-        print(f"预加载完成！共 {len(self.images)} 张图片。")
+
             
     def __len__(self):
-        return len(self.images)
+        return len(self.dataset)
     
     def __getitem__(self, idx):
-        img = self.images[idx]
-        target = self.targets[idx]
-        
-        if self.transform:
-            img = self.transform(img)
-            
-        return img, target
+       return self.dataset[idx]
 
 @typechecked
 def get_dataset(dataset_name: str) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset, int]:
@@ -53,15 +37,23 @@ def get_dataset(dataset_name: str) -> Tuple[torch.utils.data.Dataset, torch.util
     """
     if dataset_name == 'cifar10':
         data_dir = './data/cifar/'
+        # [修复] 增加 CIFAR-10 标准数据增强，防止过拟合
         apply_transform = transforms.Compose(
-            [transforms.Resize(size=(32, 32)),
+            [transforms.RandomCrop(32, padding=4),
+             transforms.RandomHorizontalFlip(),
              transforms.ToTensor(),
              transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
+        
+        # 测试集不需要增强，只需要归一化
+        test_transform = transforms.Compose(
+            [transforms.ToTensor(),
+             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
+             
         train_dataset = datasets.CIFAR10(data_dir, train=True, download=True,
                                          transform=apply_transform)
 
         test_dataset = datasets.CIFAR10(data_dir, train=False, download=True,
-                                        transform=apply_transform)
+                                        transform=test_transform)
         return train_dataset, test_dataset, 10
 
     elif dataset_name == 'cifar100':
@@ -100,6 +92,8 @@ def get_dataset(dataset_name: str) -> Tuple[torch.utils.data.Dataset, torch.util
         train_transform = transforms.Compose([
             transforms.RandomCrop(64, padding=4),
             transforms.RandomHorizontalFlip(),
+            # [新增] 增加颜色抖动，进一步防止过拟合
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
         ])
@@ -112,8 +106,10 @@ def get_dataset(dataset_name: str) -> Tuple[torch.utils.data.Dataset, torch.util
         test_path = os.path.join(data_dir, 'val') # 通常用 val 作为测试集
         
         # 注意：需确保 val 目录下已按类别分子文件夹，否则 ImageFolder 无法识别分类        train_dataset = datasets.ImageFolder(root=train_path, transform=train_transform)
-        train_dataset = InMemoryImageFolder(root=train_path, transform=train_transform)
-        test_dataset = InMemoryImageFolder(root=test_path, transform=test_transform)
+        # [修改] 不再使用 InMemoryImageFolder 预加载，直接使用 ImageFolder 以实现秒级启动
+        # 配合 main.py 中的 persistent_workers=True，训练速度不会受影响
+        train_dataset = datasets.ImageFolder(root=train_path, transform=train_transform)
+        test_dataset = datasets.ImageFolder(root=test_path, transform=test_transform)
         
         return train_dataset, test_dataset, 200
 
