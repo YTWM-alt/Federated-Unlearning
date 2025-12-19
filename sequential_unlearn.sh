@@ -68,7 +68,6 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --retraining_dir $RETRAIN_MODEL_PATH \
             --apply_membership_inference true \
             --mia_verbose false \
-            --mia_scope all \
             --fair_auto_tune_all false \
             --fair_auto_erase false \
             --fe_max_step_ratio 0.001 \

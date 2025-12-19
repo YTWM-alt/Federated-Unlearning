@@ -670,8 +670,6 @@ parser.add_argument('--apply_membership_inference', type=str2bool, default=False
 # 是否打印 MIA 详细调试信息（默认不打印）
 parser.add_argument('--mia_verbose', type=str2bool, default=False,
                         help='Print detailed diagnostics for MIA (default: false)')
-parser.add_argument('--mia_scope', type=str, choices=['none','fair_only','all'], default='fair_only',
-                    help="成员推断范围：none 不跑；fair_only 仅 FAIR-VUE 那一次；all 还会在后处理区块对 retrain/其他基线再跑")
 parser.add_argument('--attack_type', type=str, default='blackbox', choices=["blackbox", "whitebox"],
                     help='attack type')
 
@@ -1045,10 +1043,7 @@ if __name__ == "__main__":
     attack_model = locals().get("attack_model", None)
     mia_shadow_nonmem_loader = locals().get("mia_shadow_nonmem_loader", None)
     mia_eval_nonmem_loader   = locals().get("mia_eval_nonmem_loader", None)
-    # [修改] 只有在 'all' 或 'full_training' 阶段才真正去训练 MIA 攻击模型。
-    # 在 'unlearning' 调参阶段，训练攻击模型极其耗时且对调节遗忘参数无帮助，强制跳过。
-    # 如果你需要最终的 MIA 指标，请使用 'all' 模式或手动注释此逻辑。
-    should_train_mia = args.apply_membership_inference and (args.execution_stage in ['all', 'full_training'])
+    should_train_mia = args.apply_membership_inference
 
     if should_train_mia:
         # 1) 准备“互斥”的非成员集（shadow/eval）
@@ -1087,15 +1082,12 @@ if __name__ == "__main__":
                 shadow_client_loaders=clientwise_dataloaders,
                 shadow_test_loader=mia_shadow_nonmem_loader,
                 dataset=args.dataset, device=args.device)
-    elif args.execution_stage == 'unlearning' and args.apply_membership_inference:
-        if args.verbose:
-            print(">>> [Unlearning Stage] Skipping MIA Attack Model training to save time (Hyperparameter Tuning Mode).")
+
 
 
     # ==== 六项指标统一打印（Training 基线）+ MIA：只要 --apply_membership_inference 就默认跑 ====
     mia_training = None
-    # [修改] 仅在 'all' 或 'full_training' 阶段跑
-    if args.apply_membership_inference and args.execution_stage in ['all', 'full_training']:
+    if args.apply_membership_inference:
         # 在“训练好的完整模型”上执行成员推断（评估集非成员与 shadow 非成员互斥）
         mia_training = evaluate_mia_attack(
             target_model=deepcopy(global_model),
@@ -1296,8 +1288,7 @@ if __name__ == "__main__":
 
         # ==== 统一打印（Retrain Baseline）+ MIA：只要开启 MIA 就默认跑 ====
         mia_retrain = None
-        # [修改] 只有在真正跑 Retraining 任务时才测评，Unlearning 阶段即便加载了也不测，省时间
-        if args.apply_membership_inference and args.execution_stage in ['all', 'retraining']:
+        if args.apply_membership_inference:
             mia_retrain = evaluate_mia_attack(
                 target_model=deepcopy(retrained_global_model),
                 attack_model=attack_model,
@@ -1382,7 +1373,7 @@ if __name__ == "__main__":
             # ==== 统一打印（Retrain Baseline，Loaded）+ MIA：只要开启 MIA 就默认跑 ====
             mia_retrain = None
             # 只有当 attack_model 真正被训练了 (not None) 才跑 MIA
-            if args.apply_membership_inference and attack_model is not None and args.execution_stage in ['all', 'retraining']:
+            if args.apply_membership_inference and attack_model is not None:
                 mia_retrain = evaluate_mia_attack(
                     target_model=deepcopy(retrained_global_model),
                     attack_model=attack_model,
@@ -1518,7 +1509,8 @@ if __name__ == "__main__":
                     test_loader=test_dataloader,
                     dataset=args.dataset,
                     forget_client_idx=args.forget_clients[0],
-                    device=args.device
+                    device=args.device,
+                    eval_nonmem_loader=mia_eval_nonmem_loader
                 )
             print_forgetting_metrics("PGA", test_acc_pga, target_acc_pga, target_loss_pga, speedup_pga, angle_pga, mia_pga)
             _pm_pga.__exit__(None, None, None)
@@ -1959,123 +1951,114 @@ if __name__ == "__main__":
                 # Step5: 累积特异分量结束
                 _fv_last_t = _fv_time_mark("step5_accumulate_spec", _t0, _fv_last_t)
 
-            # === 自动调参 erase_scale（仅 parameters；不访问原始数据）===
-            # 1) 解析参数
-            def _parse_pair_csv(s: str):
-                xs = [float(x) for x in s.split(',') if x.strip()!='']
-                if len(xs) < 2:
-                    return 0.0, 0.04
-                return xs[0], xs[1]
-            def _parse_list_csv(s: str):
-                return [float(x) for x in s.split(',') if x.strip()!='']
-            target_lo, target_hi = _parse_pair_csv(getattr(args, "fair_drop_bounds", "0.00,0.04"))
-            grid_mults = _parse_list_csv(getattr(args, "fair_grid_scales", "0.5,0.75,1.0,1.25,1.5"))
-            bisect_steps = int(getattr(args, "fair_bisect_steps", 3))
-
-            # 2) 诊断量：Fisher 能量 & 特异性分
-            def _fisher_energy(vec_1d: torch.Tensor) -> float:
-                like = state_dict_like_by_keys(vec_1d.to('cpu'), start_sd, param_keys)
-                s = 0.0
-                for k in param_keys:
-                    Fi = fisher.get(k, None)
-                    if Fi is None:
-                        continue
-                    v = like[k].to(Fi.device).float()
-                    s += float((Fi.float().flatten() * (v.flatten()**2)).sum().item())
-                return s
-            spec_energy = _fisher_energy(spec_total)
-            def _safe_cos(a: torch.Tensor, b: torch.Tensor) -> float:
-                na = torch.norm(a); nb = torch.norm(b)
-                if na.item()==0 or nb.item()==0:
-                    return 0.0
-                return float(torch.dot(a, b) / (na*nb))
-            with torch.no_grad():
-                unit_spec = spec_total / (torch.norm(spec_total) + 1e-12)
-                cos_list = []
-                # 采样最多 256 个“其它客户端增量”估计平均相似度，避免过慢
-                take = other_deltas_list[:256]
-                for d in take:
-                    v = flatten_by_keys(d, param_keys, device=dev)
-                    cos_list.append(_safe_cos(unit_spec, v))
-                avg_cos = sum(cos_list)/max(1, len(cos_list))
-                idio = max(0.0, min(1.0, 1.0 - avg_cos))  # 特异性分：越大越“特”
-            if args.fair_vue_debug:
-                print(f"[FV-DBG] spec_fisher_energy={spec_energy:.3e}, avg_cos={avg_cos:.3f}, idiosyncrasy={idio:.3f}")
-
-            # 3) 基线精度（未擦除）：**与 _eval_acc 用同一路径**，避免参照不一致
-            baseline_acc = None
-
-            # 4) 构造候选 α：围绕用户设定的 base_alpha 做粗网格 + 特异性修正点
+            # === 擦除系数确定 ===
             base_alpha = float(getattr(args, 'fair_erase_scale', 0.25))
-            alpha0 = base_alpha * (0.7 + 0.6*idio)  # 0.7~1.3×，随特异性调整
-            cands = sorted(set([0.0] + [max(0.0, m*base_alpha) for m in grid_mults] + [alpha0]))
+            erase_scale = base_alpha
 
-            # 评估函数：临时应用 α·spec_total 到参数并测一次测试集精度（不改动原模型）
-            def _eval_acc(alpha: float) -> float:
-                param_now = flatten_by_keys(start_sd, param_keys, device=dev)
-                param_new = param_now - float(alpha) * spec_total
-                new_params = state_dict_like_by_keys(param_new.to('cpu'), start_sd, param_keys)
-                tmp_sd = dict(start_sd)
-                for k in param_keys:
-                    tmp_sd[k] = new_params[k]
-                tmp_model = deepcopy(fair_model).to(args.device)
-                tmp_model.load_state_dict(tmp_sd)
-                acc = float(get_accuracy_only(tmp_model, test_dataloader, args.device))
-                del tmp_model
-                return acc
+            if getattr(args, 'fair_auto_erase', False):
+                # === 自动调参 erase_scale（仅 parameters；不访问原始数据）===
+                # 1) 解析参数
+                def _parse_pair_csv(s: str):
+                    xs = [float(x) for x in s.split(',') if x.strip()!='']
+                    if len(xs) < 2:
+                        return 0.0, 0.04
+                    return xs[0], xs[1]
+                def _parse_list_csv(s: str):
+                    return [float(x) for x in s.split(',') if x.strip()!='']
+                target_lo, target_hi = _parse_pair_csv(getattr(args, "fair_drop_bounds", "0.00,0.04"))
+                grid_mults = _parse_list_csv(getattr(args, "fair_grid_scales", "0.5,0.75,1.0,1.25,1.5"))
+                bisect_steps = int(getattr(args, "fair_bisect_steps", 3))
 
-            # 用同一条评估链路测 baseline，确保 drop(0)==0
-            baseline_acc = _eval_acc(0.0)
-
-            # 5) 粗网格搜索
-            evals = [(a, _eval_acc(a)) for a in cands]
-            drops = [(a, max(0.0, baseline_acc - acc)) for (a, acc) in evals]
-            under = max([a for a, d in drops if d <= target_lo + 1e-6], default=None)
-            over  = min([a for a, d in drops if d >= target_hi - 1e-6], default=None)
- 
-
-            if under is None and over is None:
-                # 没覆盖目标区间：选距离区间中点最近的 α
-                mid = 0.5*(target_lo + target_hi)
-                chosen = min(drops, key=lambda t: abs(t[1]-mid))[0]
-            else:
-                # 6) 二分细化到 [target_lo, target_hi] 内
-                #    若最小候选就超标（under=None 且 over存在且 over==min(cands)），强制从 [0.0, over] 开始搜
-                lo = under if under is not None else 0.0
-                hi = over  if over  is not None else max(cands)
+                # 2) 诊断量：Fisher 能量 & 特异性分
+                def _fisher_energy(vec_1d: torch.Tensor) -> float:
+                    like = state_dict_like_by_keys(vec_1d.to('cpu'), start_sd, param_keys)
+                    s = 0.0
+                    for k in param_keys:
+                        Fi = fisher.get(k, None)
+                        if Fi is None:
+                            continue
+                        v = like[k].to(Fi.device).float()
+                        s += float((Fi.float().flatten() * (v.flatten()**2)).sum().item())
+                    return s
+                spec_energy = _fisher_energy(spec_total)
+                def _safe_cos(a: torch.Tensor, b: torch.Tensor) -> float:
+                    na = torch.norm(a); nb = torch.norm(b)
+                    if na.item()==0 or nb.item()==0:
+                        return 0.0
+                    return float(torch.dot(a, b) / (na*nb))
+                with torch.no_grad():
+                    unit_spec = spec_total / (torch.norm(spec_total) + 1e-12)
+                    cos_list = []
+                    # 采样最多 256 个“其它客户端增量”估计平均相似度，避免过慢
+                    take = other_deltas_list[:256]
+                    for d in take:
+                        v = flatten_by_keys(d, param_keys, device=dev)
+                        cos_list.append(_safe_cos(unit_spec, v))
+                    avg_cos = sum(cos_list)/max(1, len(cos_list))
+                    idio = max(0.0, min(1.0, 1.0 - avg_cos))  # 特异性分：越大越“特”
                 if args.fair_vue_debug:
-                    print(f"[FV-DBG] bracket init: lo={lo:.4f}, hi={hi:.4f}")
-                chosen = None
-                for _ in range(max(0, bisect_steps)):
-                    mid_a = 0.5*(lo + hi)
-                    acc_m = _eval_acc(mid_a)
-                    drop_m = max(0.0, baseline_acc - acc_m)
-                    if args.fair_vue_debug:
-                        print(f"[FV-DBG] bisect α={mid_a:.4f} → drop={drop_m:.4f}")
-                    if drop_m < target_lo:
-                        lo = mid_a
-                    elif drop_m > target_hi:
-                        hi = mid_a
-                    else:
-                        chosen = mid_a
-                        break
-                if chosen is None:
-                    # 仍未命中：在端点 lo/hi 中择一使下降更接近区间
-                    def _dist_to_interval(x, L, H): return 0.0 if L<=x<=H else min(abs(x-L), abs(x-H))
-                    acc_lo = _eval_acc(lo); acc_hi = _eval_acc(hi)
-                    drop_lo = max(0.0, baseline_acc - acc_lo)
-                    drop_hi = max(0.0, baseline_acc - acc_hi)
-                    chosen = lo if _dist_to_interval(drop_lo, target_lo, target_hi) <= _dist_to_interval(drop_hi, target_lo, target_hi) else hi
-                if args.fair_vue_debug:
-                    print(f"[FV-DBG] bracket final: lo→{lo:.4f}, hi→{hi:.4f}, chosen={chosen:.4f}")
+                    print(f"[FV-DBG] spec_fisher_energy={spec_energy:.3e}, avg_cos={avg_cos:.3f}, idiosyncrasy={idio:.3f}")
 
+                # 3) 评估函数：临时应用 α·spec_total 到参数并测一次测试集精度
+                def _eval_acc(alpha: float) -> float:
+                    param_now = flatten_by_keys(start_sd, param_keys, device=dev)
+                    param_new = param_now - float(alpha) * spec_total
+                    new_params = state_dict_like_by_keys(param_new.to('cpu'), start_sd, param_keys)
+                    tmp_sd = dict(start_sd)
+                    for k in param_keys:
+                        tmp_sd[k] = new_params[k]
+                    tmp_model = deepcopy(fair_model).to(args.device)
+                    tmp_model.load_state_dict(tmp_sd)
+                    acc = float(get_accuracy_only(tmp_model, test_dataloader, args.device))
+                    del tmp_model
+                    return acc
+
+                # 用同一条评估链路测 baseline，确保 drop(0)==0
+                baseline_acc = _eval_acc(0.0)
+
+                # 4) 构造候选 α
+                alpha0 = base_alpha * (0.7 + 0.6*idio)
+                cands = sorted(set([0.0] + [max(0.0, m*base_alpha) for m in grid_mults] + [alpha0]))
+
+                # 5) 粗网格搜索
+                evals = [(a, _eval_acc(a)) for a in cands]
+                drops = [(a, max(0.0, baseline_acc - acc)) for (a, acc) in evals]
+                under = max([a for a, d in drops if d <= target_lo + 1e-6], default=None)
+                over  = min([a for a, d in drops if d >= target_hi - 1e-6], default=None)
+
+                if under is None and over is None:
+                    # 没覆盖目标区间
+                    mid = 0.5*(target_lo + target_hi)
+                    chosen = min(drops, key=lambda t: abs(t[1]-mid))[0]
+                else:
+                    # 6) 二分细化
+                    lo = under if under is not None else 0.0
+                    hi = over  if over  is not None else max(cands)
+                    chosen = None
+                    for _ in range(max(0, bisect_steps)):
+                        mid_a = 0.5*(lo + hi)
+                        acc_m = _eval_acc(mid_a)
+                        drop_m = max(0.0, baseline_acc - acc_m)
+                        if args.fair_vue_debug:
+                            print(f"[FV-DBG] bisect α={mid_a:.4f} → drop={drop_m:.4f}")
+                        if drop_m < target_lo:
+                            lo = mid_a
+                        elif drop_m > target_hi:
+                            hi = mid_a
+                        else:
+                            chosen = mid_a
+                            break
+                    if chosen is None:
+                        def _dist_to_interval(x, L, H): return 0.0 if L<=x<=H else min(abs(x-L), abs(x-H))
+                        drop_lo = max(0.0, baseline_acc - _eval_acc(lo))
+                        drop_hi = max(0.0, baseline_acc - _eval_acc(hi))
+                        chosen = lo if _dist_to_interval(drop_lo, target_lo, target_hi) <= _dist_to_interval(drop_hi, target_lo, target_hi) else hi
+                
+                erase_scale = chosen
                 # Step6: 自动擦除系数搜索结束
                 _fv_last_t = _fv_time_mark("step6_auto_erase_search", _t0, _fv_last_t)
- 
-
-            erase_scale = float(chosen if getattr(args, 'fair_auto_erase', True) else base_alpha)
-            if args.fair_vue_debug:
-                print(f"[FV-DBG] erase_scale(chosen)={erase_scale:.4f} (base={base_alpha:.4f}, bounds=[{target_lo:.3f},{target_hi:.3f}])")
+            else:
+                    print(f"[FV-DBG] Auto-erase is DISABLED, using erase_scale={erase_scale}")
 
             # 7) 应用最终擦除到模型参数
             # [Corrected] 修正后的正交恢复：
@@ -2122,15 +2105,16 @@ if __name__ == "__main__":
 
             if args.fair_vue_debug:
                 _fv_last_t = _fv_time_mark("step7_apply_erase", _t0, _fv_last_t)
-
-
            
-            # 9) 评测
+
+            fair_time_sec = time.time() - _t0
+            print(f"[Timing] FAIR-VUE time: {fair_time_sec:.2f}s")
+
+
+            # 9) 评测 (移到计时结束后)
             perf = get_performance(model=fair_model, test_dataloader=test_dataloader,
                                 clientwise_dataloader=clientwise_dataloaders,
                                 num_classes=num_classes, device=args.device)
-            fair_time_sec = time.time() - _t0
-            print(f"[Timing] FAIR-VUE time: {fair_time_sec:.2f}s")
 
             if args.fair_vue_debug:
                 # Step8: 评测与汇总结束（总时间再标一遍）
@@ -2155,7 +2139,7 @@ if __name__ == "__main__":
             angle_fair       = cosine_angle_between_models(fair_model, retrained_global_model) if has_retrain_baseline else None
 
             mia_fair = None
-            if args.apply_membership_inference and args.mia_scope in ('fair_only','all'):
+            if args.apply_membership_inference:
                 if args.mia_verbose:
                     print("\n[调试] 开始执行成员推断攻击 (evaluate_mia_attack)...")
                 # 与其他分支保持一致：对目标客户端执行成员推断
@@ -2387,7 +2371,8 @@ if __name__ == "__main__":
                     test_loader=test_dataloader,
                     dataset=args.dataset,
                     forget_client_idx=args.forget_clients[0],
-                    device=args.device
+                    device=args.device,
+                    eval_nonmem_loader=mia_eval_nonmem_loader
                 )
             print_forgetting_metrics("CONDA", test_acc_conda, target_acc_conda, target_loss_conda, speedup_conda, angle_conda, mia_conda)
             _pm_conda.__exit__(None, None, None)
@@ -2436,6 +2421,24 @@ if __name__ == "__main__":
         forget_loader = clientwise_dataloaders[forget_client]
         acc = get_accuracy_only(fedfim_model, forget_loader, args.device)
         print(f"[FedFIM模型] 忘却客户端{forget_client}自有数据精度: {acc*100:.2f}%")
+        
+        mia_fedfim = None
+        if args.apply_membership_inference:
+            mia_fedfim = evaluate_mia_attack(
+                target_model=deepcopy(fedfim_model),
+                attack_model=attack_model,
+                client_loaders=clientwise_dataloaders,
+                test_loader=test_dataloader,
+                dataset=args.dataset,
+                forget_client_idx=args.forget_clients[0],
+                device=args.device,
+                eval_nonmem_loader=mia_eval_nonmem_loader
+            )
+        # 补充打印 FedFIM 的完整指标
+        speedup_fim = None # FedFIM 暂未在主流程计时
+        angle_fim = cosine_angle_between_models(fedfim_model, retrained_global_model) if has_retrain_baseline else None
+        print_forgetting_metrics("FedFIM", acc, acc, eval_ce_loss(fedfim_model, forget_loader, args.device), speedup_fim, angle_fim, mia_fedfim)
+
         _pm_fim.__exit__(None, None, None)
         _print_mem_overhead("FedFIM", _pm_fim, summary)
 
@@ -2443,71 +2446,7 @@ if __name__ == "__main__":
 
     # check mia precision and recall on all model
     summary['mia_attack'] = {}
-    if args.apply_membership_inference and args.mia_scope=='all':
-        import time as _t, gc as _gc
-        import torch as _torch
-        def _sync_cuda():
-            try:
-                if _torch.cuda.is_available() and str(args.device).startswith("cuda"):
-                    _torch.cuda.synchronize()
-                    _torch.cuda.empty_cache()
-            except Exception:
-                pass
-            _gc.collect()
 
-        if not args.skip_retraining:
-            print("[MIA] 开始对 retraining 模型执行成员推断...")
-            _t0=_t.time()
-            retrained_mia_result = evaluate_mia_attack(target_model=deepcopy(retrained_global_model),
-                                                    attack_model=attack_model,
-                                                    client_loaders=clientwise_dataloaders,
-                                                    test_loader=test_dataloader,
-                                                    dataset=args.dataset,
-                                                    forget_client_idx=args.forget_clients[0],
-                                                    device=args.device)
-            print(f"[MIA] retraining 完成，用时 {(_t.time()-_t0):.2f}s")
-            summary['mia_attack']['after_retraining'] = _shrink_mia_result(retrained_mia_result)
-            _sync_cuda()
-            if args.verbose:
-                print(
-                    f"MIA results after retraining : {retrained_mia_result}")
-
-        for baseline in baselines_methods:
-            if baseline == 'pga':
-
-                print("[MIA] 开始对 PGA 模型执行成员推断...")
-                _t0=_t.time()
-                pga_mia_result = evaluate_mia_attack(target_model=deepcopy(unlearned_pga_model),
-                                                     attack_model=attack_model,
-                                                     client_loaders=clientwise_dataloaders,
-                                                     test_loader=test_dataloader,
-                                                     dataset=args.dataset,
-                                                     forget_client_idx=args.forget_clients[0],
-                                                     device=args.device,
-                                                     eval_nonmem_loader=mia_eval_nonmem_loader)
-                print(f"[MIA] PGA 完成，用时 {(_t.time()-_t0):.2f}s")
-                summary['mia_attack']['after_pga'] = _shrink_mia_result(pga_mia_result)
-                _sync_cuda()
-                
-                if args.verbose:
-                    print(
-                        f"MIA results after pga : {pga_mia_result}")
-            elif baseline == 'fed_eraser':
-                print("[MIA] 开始对 FedEraser 模型执行成员推断...")
-                _t0=_t.time()
-                federaser_mia_result = evaluate_mia_attack(target_model=deepcopy(unlearned_federaser_model),
-                                                           attack_model=attack_model,
-                                                           client_loaders=clientwise_dataloaders,
-                                                           test_loader=test_dataloader,
-                                                           dataset=args.dataset,
-                                                           forget_client_idx=args.forget_clients[0],
-                                                           device=args.device)
-                print(f"[MIA] FedEraser 完成，用时 {(_t.time()-_t0):.2f}s")
-                summary['mia_attack']['after_federaser'] = _shrink_mia_result(federaser_mia_result)
-                _sync_cuda()
-                if args.verbose:
-                    print(
-                        f"MIA results after federaser : {federaser_mia_result}")
 
     # Add configurations to the summary
     summary['config'] = vars(args)
