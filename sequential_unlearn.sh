@@ -5,24 +5,24 @@
 # ============================================
 
 # 固定参数
-DATASET="tinyimagenet"
+DATASET="cifar10"
 MODEL="resnet18"
 OPTIMIZER="sgd"
 TOTAL_CLIENTS=20
-ITERS=200
+ITERS=150
 DEVICE="cuda"
 LR=0.01
 EPOCHS=1
 SEED=42
-FULL_TRAIN_DIR="./experiments/tinyimagenet_resnet18_alpha0.5/full_training"
-DISTRIBUTION="dirichlet"
-BASE_EXP_NAME="tinyimagenet_resnet18_alpha0.5"
+FULL_TRAIN_DIR="./experiments/cifar10_resnet18_exclusive/full_training"
+DISTRIBUTION="exclusive"
+BASE_EXP_NAME="cifar10_resnet18_exclusive"
 
 # 超参数取值范围
-FAIR_RANK_LIST=(200)
+FAIR_RANK_LIST=(106)
 FAIR_TAU_MODES=("median")
 FAIR_FISHER_BATCHES=(10)
-FAIR_ERASE_SCALES=(0.065)
+FAIR_ERASE_SCALES=(0.2)
 FORGET_CLIENTS=(0)
 
 # 循环执行实验
@@ -66,7 +66,7 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --execution_stage unlearning \
             --full_training_dir $FULL_TRAIN_DIR \
             --retraining_dir $RETRAIN_MODEL_PATH \
-            --apply_membership_inference true \
+            --apply_membership_inference false \
             --mia_verbose false \
             --fair_auto_tune_all false \
             --fair_auto_erase false \
@@ -76,8 +76,8 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --dampening_upper_bound 0.98 \
             --conda_lower_bound 0.711 \
             --conda_eps 1e-6 \
-            --conda_weights_path ./experiments/tinyimagenet_resnet18_alpha0.5_client0/full_training \
-            --pga_unlearn_lr 0.0020 \
+            --conda_weights_path ./experiments/cifar10_resnet18_exclusive_client0/full_training \
+            --pga_unlearn_lr 0.008 \
 
 
           echo "✅ 完成：client=${CID}, k=${RANK_K}, tau=${TAU_MODE}, fb=${FISHER_B}, es=${ERASE_S}"

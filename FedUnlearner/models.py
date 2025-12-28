@@ -145,26 +145,26 @@ class ResNet18(nn.Module):
     def __init__(self, num_channels=3, num_classes=10, pretrained=False):
         super().__init__()
         
-        # 1. 加载官方预训练权重 (这是精度的保证)
+        # 1. 加载基础模型
         if pretrained:
             from torchvision.models import ResNet18_Weights
             try:
-                # 新版写法
                 base = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
             except:
-                # 旧版兼容
                 base = resnet18(pretrained=True)
         else:
             base = resnet18(weights=None)
 
-        # 2. [核心回退] 不修改 conv1，保留预训练的 7x7 卷积
-        # 虽然它 stride=2 会让图片变小，但它保留了提取“边缘/纹理”的核心能力。
-        # Tiny-ImageNet (64x64) -> Conv1 -> (32x32) -> ... -> Final (2x2) -> 足够分类了！
-        
-        # 3. 只需要处理全连接层前的结构
+        # 2. [关键修复] 修改 Conv1 以匹配 Checkpoint 的 3x3 结构
+        # 你的 checkpoint 里的 base.0.weight 是 [64, 3, 3, 3]，说明之前训练时
+        # 将第一层改为了 3x3 卷积。为了加载成功，这里必须保持一致。
+        base.conv1 = nn.Conv2d(num_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        base.maxpool = nn.Identity()  # 通常配合 3x3 卷积会移除 maxpool 以保留特征图尺寸
+
+        # 3. 截取全连接层前的部分
         self.base = nn.Sequential(*list(base.children())[:-1])
         
-        # 4. 修改全连接层适配类别数
+        # 4. 修改全连接层
         in_features = base.fc.in_features
         self.drop = nn.Dropout()
         self.final = nn.Linear(in_features, num_classes)
@@ -174,7 +174,7 @@ class ResNet18(nn.Module):
         x = self.drop(x.view(-1, self.final.in_features))
         x = self.final(x)
         return x
-
+        
 class ResNet50(nn.Module):
     def __init__(self, num_classes, pretrained=False):
         super().__init__()

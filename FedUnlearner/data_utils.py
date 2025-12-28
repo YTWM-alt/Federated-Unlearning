@@ -209,3 +209,71 @@ def create_iid_data_distribution(dataset: torch.utils.data.Dataset, num_clients:
     dict_users = {i: Subset(dataset, batch_idxs[i])
                 for i in range(num_clients)}
     return dict_users
+
+
+
+@typechecked
+def create_class_exclusive_distribution(dataset: torch.utils.data.Dataset, num_clients: int, 
+                                        num_classes: int, exclusive_client: int = 0,
+                                        exclusive_classes: list = [0, 1],
+                                        shared_ratio: float = 0.3) -> Dict[int, torch.utils.data.Dataset]:
+    """
+    创建一个"双类私有+稀释共享"的分布 (User Proposed Strategy)：
+    1. Client 0 拥有 exclusive_classes (例如 [0, 1]) 的 100% 数据 (绝对权威)。
+    2. 选取这两类数据的 shared_ratio (20%) 作为公共池。
+    3. 将公共池的数据**平均切分** (Split) 给剩余客户端 (而不是复制)。
+    目的：Client 0 占绝对主导，其他客户端仅有少量样本维持基本认知，移除 Client 0 后模型性能应显著下降。
+    """
+    # 获取所有标签
+    if hasattr(dataset, 'targets'):
+        labels = np.array(dataset.targets)
+    else:
+        # 兼容 ImageFolder 等没有直接 targets 属性的情况
+        labels = np.array([y for _, y in dataset])
+
+    dict_users = {}
+
+    # 1. 准备数据容器
+    target_indices_all = [] # 存放给 Client 0 的所有目标类数据 (0和1的全量)
+    shared_pool_all = []    # 存放给其他客户端的"公共知识" (0和1的20%)
+    
+    # 2. 遍历每一个目标类别 (0 和 1)
+    for cls in exclusive_classes:
+        idx_c = np.where(labels == cls)[0]
+        np.random.shuffle(idx_c)
+        
+        # Client 0 拿走全量
+        target_indices_all.extend(idx_c.tolist())
+        
+        # 截取一部分放入公共池
+        split_point = int(len(idx_c) * shared_ratio)
+        shared_pool_all.extend(idx_c[:split_point].tolist())
+
+    # 3. 找出非目标类别 (2-9) 的索引
+    # 使用 np.isin 创建掩码
+    mask_others = ~np.isin(labels, exclusive_classes)
+    idx_others = np.where(mask_others)[0]
+
+    # 4. 配置 Client 0：拥有 Class 0+1 的全部数据
+    dict_users[exclusive_client] = Subset(dataset, target_indices_all)
+
+    # 5. 配置其他客户端：(其他类别 + 公共池的拷贝)
+    # 先将其他类别的数据平均分给剩余客户端
+    np.random.shuffle(idx_others)
+
+    
+    other_clients = [i for i in range(num_clients) if i != exclusive_client]
+    # [修改] 将公共池切分为 N 份 (Split)，而不是复制
+    # 如果 shared_pool_all 有 2000 张，19个客户端，每人分到约 105 张
+    np.random.shuffle(shared_pool_all) # 先打乱公共池
+    shared_chunks = np.array_split(shared_pool_all, len(other_clients))
+
+    if len(other_clients) > 0:
+        batch_idxs = np.array_split(idx_others, len(other_clients))
+        for i, cid in enumerate(other_clients):
+            # batch_idxs[i] (其他类) + shared_chunks[i] (极少量的目标类)
+            combined_idxs = np.concatenate((batch_idxs[i], shared_chunks[i]))
+            np.random.shuffle(combined_idxs) # 混合打乱，避免训练时 batch 分布不均
+            dict_users[cid] = Subset(dataset, combined_idxs)
+
+    return dict_users

@@ -18,7 +18,7 @@ from FedUnlearner.utils import (
     print_exp_details, print_clientwise_class_distribution,
     eval_ce_loss, cosine_angle_between_models, print_forgetting_metrics
 )
-from FedUnlearner.data_utils import get_dataset, create_dirichlet_data_distribution, create_iid_data_distribution
+from FedUnlearner.data_utils import get_dataset, create_dirichlet_data_distribution, create_iid_data_distribution, create_class_exclusive_distribution
 from FedUnlearner.fed_learn import fed_train, get_performance
 from FedUnlearner.models import AllCNN, ResNet18, SmallCNN
 from FedUnlearner.attacks.backdoor import create_backdoor_dataset, evaluate_backdoor_attack
@@ -685,7 +685,7 @@ parser.add_argument('--forget_clients', type=int, nargs='+',
 parser.add_argument('--total_num_clients', type=int,
                     default=10, help='total number of clients')
 parser.add_argument('--client_data_distribution', type=str, default='dirichlet',
-                    choices=["dirichlet", "iid"], help='client data distribution')
+                    choices=["dirichlet", "iid", "exclusive"], help='client data distribution')
 parser.add_argument('--dampening_constant', type=float,
                     default=0.5, help='dampening constant')
 parser.add_argument('--dampening_upper_bound', type=float,
@@ -825,6 +825,16 @@ if __name__ == "__main__":
     elif args.client_data_distribution == 'iid':
         clientwise_dataset = create_iid_data_distribution(train_dataset, num_clients=args.total_num_clients,
                                                           num_classes=num_classes)
+    elif args.client_data_distribution == 'exclusive':
+        # [修改] 多类主导分布：Client 0 独占 0, 1, 2, 3 的全量数据
+        # 其他客户端只有这四个类别的 20% 副本 (稀释后)
+        target_classes = [0, 1, 2, 3]
+        print(f"[Setup] 创建多类主导分布：Client {cid} 独占 Classes {target_classes}")
+        clientwise_dataset = create_class_exclusive_distribution(train_dataset, 
+                                                                 num_clients=args.total_num_clients,
+                                                                 num_classes=num_classes,
+                                                                 exclusive_client=int(cid) if cid != "NA" else 0,
+                                                                 exclusive_classes=target_classes)
     else:
         raise "Invalid client data distribution"
 
@@ -2085,7 +2095,7 @@ if __name__ == "__main__":
                 # 如果 norm_repair 极小(防除零)，则不进行过度放大
                 compensation_factor = 0.0
                 if norm_repair > 1e-6:
-                    compensation_factor = 0.6 * (norm_erase / norm_repair)
+                    compensation_factor = 0.4 * (norm_erase / norm_repair)
                 
                 # 应用动态补偿系数
                 repair_vec = repair_vec * compensation_factor
