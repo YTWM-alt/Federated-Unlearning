@@ -22,7 +22,7 @@ BASE_EXP_NAME="cifar10_resnet18_exclusive"
 FAIR_RANK_LIST=(106)
 FAIR_TAU_MODES=("median")
 FAIR_FISHER_BATCHES=(10)
-FAIR_ERASE_SCALES=(0.2)
+FAIR_ERASE_SCALES=(1.5)
 FORGET_CLIENTS=(0)
 
 # 循环执行实验
@@ -60,10 +60,12 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --fair_tau_mode $TAU_MODE \
             --fair_fisher_batches $FISHER_B \
             --fair_erase_scale $ERASE_S \
+            --fair_repair_ratio 0\
+            --fair_ablation none \
             --fair_vue_debug true \
             --skip_training true \
             --skip_retraining true \
-            --execution_stage all \
+            --execution_stage unlearning \
             --full_training_dir $FULL_TRAIN_DIR \
             --retraining_dir $RETRAIN_MODEL_PATH \
             --apply_membership_inference true \

@@ -655,6 +655,14 @@ parser.add_argument('--fair_rho_max_samples', type=int, default=128,
 parser.add_argument('--fair_use_delta_cache', type=str2bool, default=True,
                     help='FAIR-VUE: 是否启用逐轮增量缓存（默认开启）')
 
+# ==== FAIR-VUE 消融实验参数 ====
+parser.add_argument('--fair_ablation', type=str, default='none',
+                    choices=['none', 'no_fisher', 'no_repair', 'no_dual'],
+                    help='消融实验变体: none(完整), no_fisher(欧氏距离), no_repair(无修复), no_dual(无对偶优化/易OOM)')
+parser.add_argument('--fair_repair_ratio', type=float, default=0.4,
+                    help='FAIR-VUE: 能量补偿比例 (修复能量/擦除能量)，默认 0.4')
+
+
 # backdoor attack related arguments
 parser.add_argument('--apply_backdoor', type=str2bool, default=False,
                     help='是否启用后门攻击（True/False）')
@@ -1870,6 +1878,15 @@ if __name__ == "__main__":
                 # fallback：没有端点时，仅对可训练参数使用单位权重
                 fisher = {name: torch.ones_like(p) for name, p in fair_model.named_parameters() if p.requires_grad}
 
+            
+            # [Ablation] w/o Fisher: 强制覆盖 Fisher 为全 1 (退化为欧氏空间)
+            if args.fair_ablation == 'no_fisher':
+                if args.fair_vue_debug:
+                    print("[FV-ABLATION] Mode: w/o Fisher -> Overwriting Fisher with Identity (Ones).")
+                for k in fisher:
+                    fisher[k] = torch.ones_like(fisher[k])
+
+
             # === Fisher 计算完毕后，插入点 B ===
             if args.fair_vue_debug:
                 import torch
@@ -1908,6 +1925,28 @@ if __name__ == "__main__":
             if args.fair_vue_debug:
                 # Xw: T x D; V: D x k
                 print(f"[FV-DBG] Xw shape={tuple(Xw.shape)}, device={Xw.device}")
+            
+            # [Ablation] w/o Dual: 禁用 Gram-SVD 优化，直接在大矩阵上做 SVD (易 OOM)
+            if args.fair_ablation == 'no_dual':
+                if args.fair_vue_debug:
+                    print(f"[FV-ABLATION] Mode: w/o Dual -> Running raw SVD on shape {tuple(Xw.shape)} (High Risk of OOM!)")
+                try:
+                    # 直接对 T x D 矩阵做 SVD
+                    Xc = Xw - Xw.mean(dim=0, keepdim=True)
+                    # full_matrices=False 会返回 Vh (k x D)
+                    _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
+                    V = Vh.T[:, :k] # D x k
+                except RuntimeError as e:
+                    print(f"\n[FV-ABLATION] !!! OOM Triggered as expected in w/o Dual mode: {e} !!!\n")
+                    # 为了让程序不崩溃以便记录 'OOM' 结果，这里做一个假的 V 或者直接抛出
+                    raise e 
+            else:
+                # 正常路径：对偶 Gram 方法
+                V = topk_right_singular_vectors_gram(Xw, k=k)  # D × k
+            
+            if args.fair_vue_debug:
+                print(f"[FV-DBG] Xw shape={tuple(Xw.shape)}, V shape={tuple(V.shape)}")
+
             # 使用 Gram-SVD 结果 V（D×k），避免在高维上再做一次完整 SVD
             dev = V.device  # 统一使用这个设备
 
@@ -2124,13 +2163,20 @@ if __name__ == "__main__":
                 # 如果 norm_repair 极小(防除零)，则不进行过度放大
                 compensation_factor = 0.0
                 if norm_repair > 1e-6:
-                    compensation_factor = 0.4 * (norm_erase / norm_repair)
+                    compensation_factor = args.fair_repair_ratio * (norm_erase / norm_repair)
                 
                 # 应用动态补偿系数
                 repair_vec = repair_vec * compensation_factor
 
                 if args.fair_vue_debug:
                     print(f"[FV-DBG] Orthogonal Repair: ||Erase||={norm_erase:.3f}, ||RepairRaw||={norm_repair:.3f} -> Factor={compensation_factor:.3f}")
+
+            # [Ablation] w/o Repair: 强制将修复向量置零
+            if args.fair_ablation == 'no_repair':
+                if args.fair_vue_debug:
+                    print("[FV-ABLATION] Mode: w/o Repair -> Forcing repair_vec to ZERO.")
+                repair_vec = torch.zeros_like(spec_total)
+
 
             param_now   = flatten_by_keys(start_sd, param_keys, device=dev)
             # repair_vec 已经在上面被动态缩放过了，这里直接加即可
