@@ -155,6 +155,30 @@ def eval_ce_loss(model: torch.nn.Module,
             cnt += y.size(0)
     return (losses / cnt) if cnt > 0 else 0.0
 
+def eval_retain_acc(model: torch.nn.Module,
+                    client_loaders: dict,
+                    forget_clients: list,
+                    device: str = "cpu") -> float:
+    """
+    计算所有'保留客户端'（非遗忘目标）训练集上的整体准确率。
+    用于评估保留集精度 (Retain Accuracy / Fidelity)。
+    """
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for cid, loader in client_loaders.items():
+            # 跳过遗忘客户端
+            if cid in forget_clients:
+                continue
+            # 累积保留客户端的预测结果
+            for x, y in loader:
+                x, y = x.to(device), y.to(device)
+                preds = model(x).argmax(1)
+                correct += (preds == y).sum().item()
+                total += y.size(0)
+    return (correct / total) if total > 0 else 0.0
+
 
 def _flatten_model_params(model: torch.nn.Module) -> torch.Tensor:
     """
@@ -189,6 +213,7 @@ def cosine_angle_between_models(a: torch.nn.Module, b: torch.nn.Module) -> float
 
 def print_forgetting_metrics(method_name: str,
                              test_acc: float | None,
+                             retain_acc: float | None,
                              target_acc: float | None,
                              target_loss: float | None,
                              speedup_x: float | None,
@@ -304,6 +329,7 @@ def print_forgetting_metrics(method_name: str,
 
     print(f"[指标/{method_name}] "
         f"测试集准确率={fmt(test_acc,4)}  "
+        f"保留集准确率={fmt(retain_acc,4)}  "
         f"遗忘客户端准确率={fmt(target_acc,4)}  "
         f"遗忘客户端平均交叉熵={fmt(target_loss,4)}  "
         f"加速比={fmt(speedup_x,2)}×  "

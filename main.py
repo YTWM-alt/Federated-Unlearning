@@ -16,7 +16,8 @@ import gc
 
 from FedUnlearner.utils import (
     print_exp_details, print_clientwise_class_distribution,
-    eval_ce_loss, cosine_angle_between_models, print_forgetting_metrics
+    eval_ce_loss, cosine_angle_between_models, print_forgetting_metrics,
+    eval_retain_acc
 )
 from FedUnlearner.data_utils import get_dataset, create_dirichlet_data_distribution, create_iid_data_distribution, create_class_exclusive_distribution
 from FedUnlearner.fed_learn import fed_train, get_performance
@@ -1115,12 +1116,14 @@ if __name__ == "__main__":
         _forget_loader = clientwise_dataloaders[forget_client]
         test_acc_tr    = get_accuracy_only(global_model, test_dataloader, args.device)
         target_acc_tr  = get_accuracy_only(global_model, _forget_loader, args.device)
+        retain_acc_tr  = eval_retain_acc(global_model, clientwise_dataloaders, args.forget_clients, args.device)
         target_loss_tr = eval_ce_loss(global_model, _forget_loader, args.device)
         speedup_tr     = None   # 以 retrain 为基线，此处不计
         angle_tr       = None   # 需相对 retrain 的夹角，这里留空
         print_forgetting_metrics(
             method_name="Training",
             test_acc=test_acc_tr,
+            retain_acc=retain_acc_tr,
             target_acc=target_acc_tr,
             target_loss=target_loss_tr,
             speedup_x=speedup_tr,
@@ -1311,12 +1314,13 @@ if __name__ == "__main__":
             )
         test_acc_rt    = get_accuracy_only(retrained_global_model, test_dataloader, args.device)
         target_acc_rt  = get_accuracy_only(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
+        retain_acc_rt  = eval_retain_acc(retrained_global_model, clientwise_dataloaders, args.forget_clients, args.device)
         target_loss_rt = eval_ce_loss(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
         speedup_rt     = 1.0  # retrain 作为基线
         angle_rt       = 0.0
         
         if args.execution_stage in ['all', 'retraining']:
-            print_forgetting_metrics("Retrain", test_acc_rt, target_acc_rt, target_loss_rt, speedup_rt, angle_rt, mia_retrain)
+            print_forgetting_metrics("Retrain", test_acc_rt, retain_acc_rt, target_acc_rt, target_loss_rt, speedup_rt, angle_rt, mia_retrain)
         # 清理大对象
         try:
             import torch, gc
@@ -1398,10 +1402,11 @@ if __name__ == "__main__":
             if args.execution_stage in ['all', 'retraining']:
                 test_acc_rt    = get_accuracy_only(retrained_global_model, test_dataloader, args.device)
                 target_acc_rt  = get_accuracy_only(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
+                retain_acc_rt  = eval_retain_acc(retrained_global_model, clientwise_dataloaders, args.forget_clients, args.device)
                 target_loss_rt = eval_ce_loss(retrained_global_model, clientwise_dataloaders[forget_client], args.device)
                 speedup_rt     = None   # 此分支没计时，就打印 NA
                 angle_rt       = 0.0
-                print_forgetting_metrics("Retrain", test_acc_rt, target_acc_rt, target_loss_rt, speedup_rt, angle_rt, mia_retrain)
+                print_forgetting_metrics("Retrain", test_acc_rt, retain_acc_rt, target_acc_rt, target_loss_rt, speedup_rt, angle_rt, mia_retrain)
             
             try:
                 import torch, gc
@@ -1507,6 +1512,7 @@ if __name__ == "__main__":
             # ==== 六项指标统一打印（PGA）====
             test_acc_pga    = get_accuracy_only(unlearned_pga_model, test_dataloader, args.device)
             target_acc_pga  = get_accuracy_only(unlearned_pga_model, clientwise_dataloaders[forget_client], args.device)
+            retain_acc_pga  = eval_retain_acc(unlearned_pga_model, clientwise_dataloaders, args.forget_clients, args.device)
             target_loss_pga = eval_ce_loss(unlearned_pga_model, clientwise_dataloaders[forget_client], args.device)
             speedup_pga     = (t_retrain_sec / pga_time_sec) if (t_retrain_sec is not None and pga_time_sec > 0) else None
             angle_pga       = cosine_angle_between_models(unlearned_pga_model, retrained_global_model) if has_retrain_baseline else None
@@ -1522,7 +1528,7 @@ if __name__ == "__main__":
                     device=args.device,
                     eval_nonmem_loader=mia_eval_nonmem_loader
                 )
-            print_forgetting_metrics("PGA", test_acc_pga, target_acc_pga, target_loss_pga, speedup_pga, angle_pga, mia_pga)
+            print_forgetting_metrics("PGA", test_acc_pga, retain_acc_pga, target_acc_pga, target_loss_pga, speedup_pga, angle_pga, mia_pga)
             _pm_pga.__exit__(None, None, None)
             _print_mem_overhead("PGA", _pm_pga, summary)
         elif baseline == 'fed_eraser':
@@ -1593,6 +1599,7 @@ if __name__ == "__main__":
             # ==== 六项指标统一打印（FedEraser）====
             test_acc_fe    = get_accuracy_only(unlearned_federaser_model, test_dataloader, args.device)
             target_acc_fe  = get_accuracy_only(unlearned_federaser_model, clientwise_dataloaders[forget_client], args.device)
+            retain_acc_fe  = eval_retain_acc(unlearned_federaser_model, clientwise_dataloaders, args.forget_clients, args.device)
             target_loss_fe = eval_ce_loss(unlearned_federaser_model, clientwise_dataloaders[forget_client], args.device)
             speedup_fe     = (t_retrain_sec / federaser_time_sec) if (t_retrain_sec is not None and federaser_time_sec > 0) else None
             angle_fe       = cosine_angle_between_models(unlearned_federaser_model, retrained_global_model) if has_retrain_baseline else None
@@ -1608,7 +1615,7 @@ if __name__ == "__main__":
                     device=args.device,
                     eval_nonmem_loader=mia_eval_nonmem_loader
                 )
-            print_forgetting_metrics("FedEraser", test_acc_fe, target_acc_fe, target_loss_fe, speedup_fe, angle_fe, mia_fe)
+            print_forgetting_metrics("FedEraser", test_acc_fe, retain_acc_fe, target_acc_fe, target_loss_fe, speedup_fe, angle_fe, mia_fe)
             _pm_fe.__exit__(None, None, None)
             _print_mem_overhead("FedEraser", _pm_fe, summary)
         elif baseline == 'fair_vue':
@@ -2095,7 +2102,7 @@ if __name__ == "__main__":
                 # 如果 norm_repair 极小(防除零)，则不进行过度放大
                 compensation_factor = 0.0
                 if norm_repair > 1e-6:
-                    compensation_factor = 0.4 * (norm_erase / norm_repair)
+                    compensation_factor = 0.5 * (norm_erase / norm_repair)
                 
                 # 应用动态补偿系数
                 repair_vec = repair_vec * compensation_factor
@@ -2144,6 +2151,7 @@ if __name__ == "__main__":
             # ==== 六项指标统一打印（FAIR-VUE）====
             test_acc_fair    = get_accuracy_only(fair_model, test_dataloader, args.device)
             target_acc_fair  = acc
+            retain_acc_fair  = eval_retain_acc(fair_model, clientwise_dataloaders, args.forget_clients, args.device)
             target_loss_fair = eval_ce_loss(fair_model, forget_loader, args.device)
             speedup_fair     = (t_retrain_sec / fair_time_sec) if (t_retrain_sec is not None and fair_time_sec > 0) else None
             angle_fair       = cosine_angle_between_models(fair_model, retrained_global_model) if has_retrain_baseline else None
@@ -2180,6 +2188,7 @@ if __name__ == "__main__":
             print_forgetting_metrics(
                 method_name="FAIR-VUE",
                 test_acc=test_acc_fair,
+                retain_acc=retain_acc_fair,
                 target_acc=target_acc_fair,
                 target_loss=target_loss_fair,
                 speedup_x=speedup_fair,
@@ -2294,6 +2303,7 @@ if __name__ == "__main__":
             # ==== 六项指标统一打印（QuickDrop）====
             test_acc_qd    = get_accuracy_only(qd_model, test_dataloader, args.device)
             target_acc_qd  = get_accuracy_only(qd_model, clientwise_dataloaders[forget_client], args.device)
+            retain_acc_qd  = eval_retain_acc(qd_model, clientwise_dataloaders, args.forget_clients, args.device)
             target_loss_qd = eval_ce_loss(qd_model, clientwise_dataloaders[forget_client], args.device)
             speedup_qd     = (t_retrain_sec / qd_time_sec) if (locals().get('t_retrain_sec', None) is not None and qd_time_sec > 0) else None
             angle_qd       = cosine_angle_between_models(qd_model, retrained_global_model) if locals().get('has_retrain_baseline', False) else None
@@ -2309,7 +2319,7 @@ if __name__ == "__main__":
                     device=args.device,
                     eval_nonmem_loader=locals().get("mia_eval_nonmem_loader", None)
                 )
-            print_forgetting_metrics("QuickDrop", test_acc_qd, target_acc_qd, target_loss_qd, speedup_qd, angle_qd, mia_qd)
+            print_forgetting_metrics("QuickDrop", test_acc_qd, retain_acc_qd, target_acc_qd, target_loss_qd, speedup_qd, angle_qd, mia_qd)
             # 供后续可能的二次评测使用
             unlearned_quickdrop_model = deepcopy(qd_model)
             _pm_qd.__exit__(None, None, None)
@@ -2369,6 +2379,7 @@ if __name__ == "__main__":
             # 六项统一指标
             test_acc_conda    = get_accuracy_only(model_conda, test_dataloader, args.device)
             target_acc_conda  = get_accuracy_only(model_conda, clientwise_dataloaders[forget_client], args.device)
+            retain_acc_conda  = eval_retain_acc(model_conda, clientwise_dataloaders, args.forget_clients, args.device)
             target_loss_conda = eval_ce_loss(model_conda, clientwise_dataloaders[forget_client], args.device)
             speedup_conda     = (t_retrain_sec / conda_time_sec) if (t_retrain_sec is not None and conda_time_sec > 0) else None
             angle_conda       = cosine_angle_between_models(model_conda, retrained_global_model) if has_retrain_baseline else None
@@ -2384,7 +2395,7 @@ if __name__ == "__main__":
                     device=args.device,
                     eval_nonmem_loader=mia_eval_nonmem_loader
                 )
-            print_forgetting_metrics("CONDA", test_acc_conda, target_acc_conda, target_loss_conda, speedup_conda, angle_conda, mia_conda)
+            print_forgetting_metrics("CONDA", test_acc_conda, retain_acc_conda, target_acc_conda, target_loss_conda, speedup_conda, angle_conda, mia_conda)
             _pm_conda.__exit__(None, None, None)
             _print_mem_overhead("CONDA", _pm_conda, summary)
         # ----------------- FedFIM -----------------
@@ -2446,8 +2457,9 @@ if __name__ == "__main__":
             )
         # 补充打印 FedFIM 的完整指标
         speedup_fim = None # FedFIM 暂未在主流程计时
+        retain_acc_fim = eval_retain_acc(fedfim_model, clientwise_dataloaders, args.forget_clients, args.device)
         angle_fim = cosine_angle_between_models(fedfim_model, retrained_global_model) if has_retrain_baseline else None
-        print_forgetting_metrics("FedFIM", acc, acc, eval_ce_loss(fedfim_model, forget_loader, args.device), speedup_fim, angle_fim, mia_fedfim)
+        print_forgetting_metrics("FedFIM", perf['test_acc'], retain_acc_fim, acc, eval_ce_loss(fedfim_model, forget_loader, args.device), speedup_fim, angle_fim, mia_fedfim)
 
         _pm_fim.__exit__(None, None, None)
         _print_mem_overhead("FedFIM", _pm_fim, summary)
