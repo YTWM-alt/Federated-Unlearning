@@ -63,7 +63,7 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --fair_vue_debug true \
             --skip_training true \
             --skip_retraining true \
-            --execution_stage unlearning \
+            --execution_stage all \
             --full_training_dir $FULL_TRAIN_DIR \
             --retraining_dir $RETRAIN_MODEL_PATH \
             --apply_membership_inference true \

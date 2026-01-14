@@ -938,10 +938,26 @@ if __name__ == "__main__":
             # 严格校验，避免 BN buffer / 参数名不一致导致的静默偏差
             assert len(ret.missing_keys) == 0 and len(ret.unexpected_keys) == 0, \
                 f"Incompatible keys when loading endpoint model: {ret}"
+            
+            # [关键修复] 临时创建一个全新的 DataLoader，彻底隔离 MIA 的影响
+            # 无论之前 MIA 是否遍历过 self.loader，这里都强制使用固定种子生成新的迭代顺序
+            g_fisher = torch.Generator()
+            g_fisher.manual_seed(42) # 强力固定 Fisher 计算的数据顺序
+            
+            # 复用原 loader 的参数，但注入 generator
+            temp_loader = torch.utils.data.DataLoader(
+                self.loader.dataset,
+                batch_size=self.loader.batch_size,
+                shuffle=True,
+                num_workers=self.loader.num_workers,
+                drop_last=self.loader.drop_last,
+                generator=g_fisher
+            )
+
             # 用原始算法计算经验 Fisher 对角近似（保持算法不变）
             return empirical_fisher_diagonal(
                 model=model,
-                dataloader=self.loader,
+                dataloader=temp_loader, # 使用临时 loader，而非 self.loader
                 device=device,
                 max_batches=max_batches
             )
@@ -1746,6 +1762,12 @@ if __name__ == "__main__":
             # === FAIR-VUE 预自动调参（三项）：b/k/τ（不访问原始样本） ===
             #    放到 FAIR-VUE 分支内，就近使用 fv_train_path/target_* 列表
             # ==========================================================
+            # [Fix] 强制重置种子，防止 MIA 等前置操作消耗随机状态导致调参采样不一致
+            if args.seed is not None:
+                torch.manual_seed(args.seed)
+                np.random.seed(args.seed)
+                random.seed(args.seed)
+
             if args.fair_auto_tune_all:
                 if args.fair_vue_debug:
                     print("[FV-AUTO] ==== Start auto-tuning {fisher_batches, rank_k, tau_mode} ====")
@@ -2102,7 +2124,7 @@ if __name__ == "__main__":
                 # 如果 norm_repair 极小(防除零)，则不进行过度放大
                 compensation_factor = 0.0
                 if norm_repair > 1e-6:
-                    compensation_factor = 0.5 * (norm_erase / norm_repair)
+                    compensation_factor = 0.4 * (norm_erase / norm_repair)
                 
                 # 应用动态补偿系数
                 repair_vec = repair_vec * compensation_factor

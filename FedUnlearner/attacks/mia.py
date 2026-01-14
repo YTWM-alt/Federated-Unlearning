@@ -89,7 +89,7 @@ def train_attack_model(shadow_global_model, shadow_client_loaders, shadow_test_l
     att_X.sort(axis=1)
 
     X_train, X_test, y_train, y_test = train_test_split(
-        att_X, att_y, test_size=0.1)
+        att_X, att_y, test_size=0.1, random_state=42)
 
     # For possible division by zero error
     scale_pos_weight = 1.0  # 已经 1:1，无需额外权重
@@ -175,7 +175,11 @@ def evaluate_mia_attack(target_model: torch.nn.Module,
         shuffled_test_loader = eval_nonmem_loader
     else:
         # 退路：保持旧行为（但存在泄漏风险）
-        shuffled_test_loader = DataLoader(test_loader.dataset, batch_size=test_loader.batch_size, shuffle=True)
+        # 退路：使用局部生成器，防止 shuffle=True 污染全局随机状态，导致后续算法(如FAIR-VUE)结果抖动
+        g = torch.Generator()
+        g.manual_seed(42)
+        shuffled_test_loader = DataLoader(test_loader.dataset, batch_size=test_loader.batch_size, shuffle=True, generator=g)
+
     try:
         _ds = getattr(shuffled_test_loader, "dataset", None)
         _idx = getattr(_ds, "indices", None)
