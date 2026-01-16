@@ -558,11 +558,11 @@ parser.add_argument('--baselines', type=str, nargs="*", default=[],
     help='baseline methods for unlearning')
 
 # ===== PGA 超参（显式控制遗忘强度） =====
-parser.add_argument('--pga_alpha', type=float, default=0.35,
-    help='PGA: unlearning strength factor (scales both distance threshold and gradient-ascent step size)')
+parser.add_argument('--pga_alpha', type=float, default=1.95,
+    help='核心：PGA: unlearning strength factor (scales both distance threshold and gradient-ascent step size)')
 parser.add_argument('--pga_unlearn_rounds', type=int, default=5,
     help='PGA: number of gradient-ascent epochs on the forget client data')
-parser.add_argument('--pga_unlearn_lr', type=float, default=0.05,
+parser.add_argument('--pga_unlearn_lr', type=float, default=0.2,
     help='核心：PGA: learning rate used during PGA unlearning (default: use --lr)')
 
 
@@ -700,9 +700,9 @@ parser.add_argument('--dampening_constant', type=float,
 parser.add_argument('--dampening_upper_bound', type=float,
                     default=0.5, help='dampening upper bound')
 parser.add_argument('--ratio_cutoff', type=float,
-                    default=0.5, help='ratio cutoff')
+                    default=0.5, help='ratio cutoff,conda核心')
 # —— CONDA 额外安全阈值
-parser.add_argument('--conda_lower_bound', type=float, default=0.6,
+parser.add_argument('--conda_lower_bound', type=float, default=0,
                     help='CONDA: 乘子下界（避免把权重乘成接近 0）')
 parser.add_argument('--conda_eps', type=float, default=1e-6,
                     help='CONDA: 防 0 除的数值稳定项')

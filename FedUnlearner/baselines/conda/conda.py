@@ -126,6 +126,15 @@ def run_conda(global_model: torch.nn.Module,
     ]
     iter_ids = sorted(int(d.split("_")[1]) for d in items)
 
+    # [Optimization] 采样加速：限制最大扫描轮数
+    # 避免 I/O 瓶颈 (3分钟 -> 30秒)，均匀采样足以拟合参数重要性分布
+    MAX_SAMPLE_ROUNDS = 20
+    if len(iter_ids) > MAX_SAMPLE_ROUNDS:
+        step = len(iter_ids) // MAX_SAMPLE_ROUNDS
+        iter_ids = iter_ids[::step]
+        print(f"[conda] Optimization: Sampling {len(iter_ids)} rounds (step={step}) for speedup.")
+
+
     # 累积每个 client 的贡献（与旧版一致）
     avg_contributions = {}
     client_counts = {}
