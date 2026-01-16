@@ -215,10 +215,15 @@ def _local_train_on_syn(
         return model
     epochs = int(args.qd_local_epochs) if args.qd_local_epochs else int(args.num_local_epochs)
     loader = DataLoader(syn_ds, batch_size=min(len(syn_ds), max(1, args.qd_batch_syn)), shuffle=True)
+    
+    # [Fix] 使用专用遗忘参数，如果未设置则回退到全局参数
+    _lr = args.qd_unlearn_lr if (hasattr(args, 'qd_unlearn_lr') and args.qd_unlearn_lr is not None) else args.lr
+    _wd = args.qd_unlearn_wd if (hasattr(args, 'qd_unlearn_wd') and args.qd_unlearn_wd is not None) else args.weight_decay
+
     if args.optimizer == 'sgd':
-        opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+        opt = torch.optim.SGD(model.parameters(), lr=_lr, momentum=args.momentum, weight_decay=_wd)
     else:
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        opt = torch.optim.Adam(model.parameters(), lr=_lr, weight_decay=_wd)
     criterion = nn.CrossEntropyLoss()
     model.train()
     for _ in range(epochs):

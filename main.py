@@ -583,25 +583,25 @@ parser.add_argument('--fe_eps', type=float, default=1e-12,
 # ---------- fast-fU 超参（与原实现同名语义） ----------
 parser.add_argument('--fast_expected_saving', type=int, default=5,
     help='fast-fU: expected number of saved client updates (m)')
-parser.add_argument('--fast_alpha', type=float, default=0.625,
+parser.add_argument('--fast_alpha', type=float, default=0.5,
     help='核心：fast-fU: alpha coefficient')
-parser.add_argument('--fast_theta', type=float, default=2.0,
+parser.add_argument('--fast_theta', type=float, default=0.35,
     help='fast-fU: theta scaling for unlearning term')
 
 # ---------- QuickDrop 超参（贴近原实现命名/语义） ----------
-parser.add_argument('--qd_scale', type=float, default=0.6151,
+parser.add_argument('--qd_scale', type=float, default=0.01,
     help='核心：QuickDrop: 每类合成样本比例（如 0.01 表示每类约 1%）')
 parser.add_argument('--qd_method', type=str, default='dc', choices=['dc'],
     help='QuickDrop: 蒸馏方法（此实现提供 DC/gradient matching 变体）')
-parser.add_argument('--qd_syn_steps', type=int, default=25,
+parser.add_argument('--qd_syn_steps', type=int, default=5,
     help='QuickDrop: 蒸馏外循环步数（优化合成图像）')
-parser.add_argument('--qd_lr_img', type=float, default=0.075,
+parser.add_argument('--qd_lr_img', type=float, default=0.3,
     help='QuickDrop: 合成图像的学习率')
-parser.add_argument('--qd_batch_real', type=int, default=128,
+parser.add_argument('--qd_batch_real', type=int, default=64,
     help='QuickDrop: 真实批大小（用来计算目标梯度）')
 parser.add_argument('--qd_batch_syn', type=int, default=128,
     help='QuickDrop: 合成批大小（用来计算匹配梯度）')
-parser.add_argument('--qd_local_epochs', type=int, default=None,
+parser.add_argument('--qd_local_epochs', type=int, default=1,
     help='QuickDrop: 本地训练轮数（默认沿用 num_local_epochs）')
 parser.add_argument('--qd_save_affine', type=str2bool, default=False,
     help='QuickDrop: 是否保存各客户端合成（affine/synthetic）数据张量')
@@ -609,6 +609,11 @@ parser.add_argument('--qd_affine_dir', type=str, default='quickdrop_affine',
     help='QuickDrop: 合成数据保存目录（位于 experiments/exp_name 下）')
 parser.add_argument('--qd_log_interval', type=int, default=25,
     help='QuickDrop: 蒸馏外循环日志步长（每多少步打印一次进度）')
+# [新增] 专属遗忘参数，解耦训练参数
+parser.add_argument('--qd_unlearn_lr', type=float, default=None,
+    help='QuickDrop: 遗忘阶段的专用学习率 (默认使用全局 lr)')
+parser.add_argument('--qd_unlearn_wd', type=float, default=None,
+    help='QuickDrop: 遗忘阶段的专用权重衰减 (默认使用全局 weight_decay)')
 
 # 若已存在合成集缓存，则直接加载并跳过蒸馏（默认开启）
 parser.add_argument('--qd_use_affine_cache', type=str2bool, default=True,
@@ -688,7 +693,7 @@ parser.add_argument('--apply_label_poisoning', type=str2bool, default=False,
 parser.add_argument('--num_label_poison_samples', type=int, default=10,
                     help='number of label poisoning samples')
 
-# provide indexes of clients which are to be forgotten, allow multiple clients to be forgotten
+# —— CONDA provide indexes of clients which are to be forgotten, allow multiple clients to be forgotten
 parser.add_argument('--forget_clients', type=int, nargs='+',
                     default=[0], help='forget clients')
 parser.add_argument('--total_num_clients', type=int,

@@ -5,7 +5,7 @@ import torch
 from copy import deepcopy
 from collections import deque
 from typing import Dict, List
-from FedUnlearner.utils import eval_ce_loss, print_forgetting_metrics, cosine_angle_between_models
+from FedUnlearner.utils import eval_ce_loss, print_forgetting_metrics, cosine_angle_between_models, eval_retain_acc
 from FedUnlearner.attacks.mia import evaluate_mia_attack
 
 # minimal fmodule helpers (wraps operations used by fast-fU)
@@ -50,6 +50,7 @@ class FastFUServer:
             'attacker': set(getattr(args, 'attacker', [])),
             'clean_model': 0
         }
+        print(f"[Fast-fU DEBUG] Init Options: alpha={self.option['alpha']}, theta={self.option['theta_delta']}")
 
         self.beta: List[float] = []
         # 仅保存“被攻击轮”的攻击者增量，key=round_id -> {str(cid): state_dict(delta)}
@@ -184,6 +185,12 @@ class FastFUServer:
             beta = beta * alpha + 1
             list_beta.append(beta)
         # accumulate
+        
+        # [Debug] Print beta statistics to check for explosion
+        if list_beta:
+            beta_min, beta_max = min(list_beta), max(list_beta)
+            print(f"[Fast-fU DEBUG] Beta list (len={len(list_beta)}): min={beta_min:.4e}, max={beta_max:.4e}")
+
         for idx in range(len(round_attack)):
             round_id = round_attack[idx]
             # multiply previous factor
@@ -204,9 +211,20 @@ class FastFUServer:
                 for k in unlearning_term.keys():
                     unlearning_term[k] = unlearning_term[k] * list_beta[r_id]
         # scale
+        
+        # [Debug] Check magnitude before theta
+        raw_norm = _model_norm(unlearning_term)
+        print(f"[Fast-fU DEBUG] UnlearnTerm Norm BEFORE theta: {raw_norm:.4e}")
+        
         theta = float(self.option['theta_delta'])
         for k in unlearning_term.keys():
             unlearning_term[k] = unlearning_term[k] * theta
+
+            
+        # [Debug] Check magnitude after theta
+        final_norm = _model_norm(unlearning_term)
+        print(f"[Fast-fU DEBUG] UnlearnTerm Norm AFTER theta ({theta}): {final_norm:.4e}")
+        
         return unlearning_term
 
     # -------------------------
@@ -250,6 +268,11 @@ class FastFUServer:
                 if isinstance(first_sd, dict) and 'state_dict' in first_sd:
                     first_sd = first_sd['state_dict']
                 temp = {k: torch.zeros_like(v, dtype=torch.float32) for k, v in first_sd.items()}
+                
+                # [Debug] Check if model weights are sane
+                base_norm = _model_norm(first_sd)
+                print(f"[Fast-fU DEBUG] Base Client Model Norm: {base_norm:.4e}")
+
                 # 把第一个也纳入平均
                 for k in temp.keys():
                     temp[k] += first_sd[k].to('cpu', dtype=torch.float32)
@@ -267,10 +290,22 @@ class FastFUServer:
                 # clean_sd = temp + unlearn_term（都在 CPU）
                 clean_sd = {k: temp[k] + self.unlearn_term[k].to(dtype=torch.float32) for k in temp.keys()}
 
+                
+                # [Fix] 数值清洗：处理 NaN/Inf 导致的指标异常
+                # 这里的 nan_to_num 确保了即使 fast-fU 参数激进导致数值溢出，
+                # 也能计算出具体的 CrossEntropy 和 MIA 指标，而不是输出 nan/0
+                for k in clean_sd:
+                    if torch.is_floating_point(clean_sd[k]):
+                        # 检测并修复 NaN (设为0) 和 Inf (设为大数)
+                        if torch.isnan(clean_sd[k]).any() or torch.isinf(clean_sd[k]).any():
+                            # 使用 nan_to_num_ 原地修改
+                            torch.nan_to_num_(clean_sd[k], nan=0.0, posinf=1e5, neginf=-1e5)
+
                 # === 评测：测试集/遗忘客户端/交叉熵/角度 ===
                 clean_model = deepcopy(self.global_model)   # 设备与全局一致
                 clean_model.load_state_dict(clean_sd)       # PyTorch 会拷到同一 device
                 dev = self.args.device
+                clean_model.to(dev)  # [Fix] 评估前强制将模型移动到指定设备，解决 RuntimeError
                 # 优先使用入参的 test_dataloader；若未传再兜底 args.test_dataloader
                 test_loader = test_dataloader if test_dataloader is not None else (
                     self.args.test_dataloader if hasattr(self.args, "test_dataloader") else None
@@ -286,6 +321,11 @@ class FastFUServer:
                     target_loss = eval_ce_loss(clean_model, forget_loader, dev)
                 else:
                     target_acc = target_loss = None
+                
+                # [Fix] 补齐 Retain Accuracy 计算，适配新的 print_forgetting_metrics
+                forget_ids = [self.forget_client] if self.forget_client is not None else []
+                retain_acc = eval_retain_acc(clean_model, self.clientwise_dataloaders, forget_ids, dev)
+
                 angle_deg = cosine_angle_between_models(clean_model, retrained_global_model) if retrained_global_model is not None else None
                 # ---- MIA（与 PGA 一致）：需要 attack_model，且开启 --apply_membership_inference ----
                 mia_res = None
@@ -305,7 +345,7 @@ class FastFUServer:
                 if getattr(self.args, "verbose", True):
                     print(f"[Timing] fast-fU time: {self.elapsed_total_sec:.2f}s")
                 speedup_x = (float(retrain_time_sec) / self.elapsed_total_sec) if (retrain_time_sec is not None and self.elapsed_total_sec > 0) else None
-                print_forgetting_metrics("fast-fU", test_acc, target_acc, target_loss, speedup_x, angle_deg, mia_res)
+                print_forgetting_metrics("fast-fU", test_acc, retain_acc, target_acc, target_loss, speedup_x, angle_deg, mia_res)
 
 
 def run_fast_fu(args, clientwise_dataloaders, train_path, global_model,

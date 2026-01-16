@@ -9,7 +9,7 @@ DATASET="cifar10"
 MODEL="resnet18"
 OPTIMIZER="sgd"
 TOTAL_CLIENTS=20
-ITERS=200
+ITERS=1
 DEVICE="cuda"
 LR=0.01
 EPOCHS=1
@@ -22,7 +22,7 @@ BASE_EXP_NAME="cifar10_resnet18_exclusive"
 FAIR_RANK_LIST=(106)
 FAIR_TAU_MODES=("median")
 FAIR_FISHER_BATCHES=(10)
-FAIR_ERASE_SCALES=(0.2)
+FAIR_ERASE_SCALES=(0.265)
 FORGET_CLIENTS=(0)
 
 # 循环执行实验
@@ -55,14 +55,14 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --num_participating_clients -1 \
             --seed $SEED \
             --num_local_epochs $EPOCHS \
-            --baselines fast_fu\
+            --baselines fair_vue\
             --fair_rank_k $RANK_K \
             --fair_tau_mode $TAU_MODE \
             --fair_fisher_batches $FISHER_B \
             --fair_erase_scale $ERASE_S \
-            --fair_repair_ratio 0.4\
+            --fair_repair_ratio 0.2\
             --fair_ablation none \
-            --fair_vue_debug true \
+            --fair_vue_debug false \
             --skip_training true \
             --skip_retraining true \
             --execution_stage unlearning \
@@ -72,14 +72,15 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --mia_verbose false \
             --fair_auto_tune_all false \
             --fair_auto_erase false \
-            --fe_max_step_ratio 0.001 \
+            --fe_max_step_ratio 0.1 \
             --ratio_cutoff 0.17 \
             --dampening_constant 0.2 \
             --dampening_upper_bound 0.2 \
             --conda_eps 1e-6 \
             --conda_weights_path ./experiments/cifar10_resnet18_exclusive/full_training \
             --pga_unlearn_lr 4 \
-
+            --qd_unlearn_lr 0.07375 \
+            --qd_unlearn_wd 0.02 \
 
           echo "✅ 完成：client=${CID}, k=${RANK_K}, tau=${TAU_MODE}, fb=${FISHER_B}, es=${ERASE_S}"
           echo
