@@ -38,7 +38,7 @@ def fed_train(num_training_iterations: int, test_dataloader: torch.utils.data.Da
         client_contributions[client_idx] = []
 
     best_acc = 0
-    patience = 10
+    patience = 100
     counter = 0
     
     # [修复] 记录初始学习率，用于计算全局衰减

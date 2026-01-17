@@ -142,7 +142,7 @@ class AllCNN(nn.Module):
 
 
 class ResNet18(nn.Module):
-    def __init__(self, num_channels=3, num_classes=10, pretrained=False):
+    def __init__(self, num_channels=3, num_classes=10, pretrained=False, dataset='cifar10'):
         super().__init__()
         
         # 1. 加载基础模型
@@ -155,11 +155,17 @@ class ResNet18(nn.Module):
         else:
             base = resnet18(weights=None)
 
-        # 2. [关键修复] 修改 Conv1 以匹配 Checkpoint 的 3x3 结构
-        # 你的 checkpoint 里的 base.0.weight 是 [64, 3, 3, 3]，说明之前训练时
-        # 将第一层改为了 3x3 卷积。为了加载成功，这里必须保持一致。
-        base.conv1 = nn.Conv2d(num_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        base.maxpool = nn.Identity()  # 通常配合 3x3 卷积会移除 maxpool 以保留特征图尺寸
+        # 2. [动态修复] 根据数据集调整 Conv1 结构
+        # TinyImageNet(64x64) 的 checkpoint 使用的是标准 7x7 卷积 ([64, 3, 7, 7])
+        # CIFAR(32x32) / MNIST(28x28) 使用的是修改版 3x3 卷积 ([64, c, 3, 3])
+        if dataset in ['cifar10', 'cifar100', 'mnist']:
+            base.conv1 = nn.Conv2d(num_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            base.maxpool = nn.Identity()
+        else:
+            # TinyImageNet 或其他：保持标准 ResNet 结构 (7x7, stride=2)
+            # 如果通道数不是3 (虽然TinyImageNet是3)，需重置第一层以匹配通道
+            if num_channels != 3:
+                base.conv1 = nn.Conv2d(num_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
 
         # 3. 截取全连接层前的部分
         self.base = nn.Sequential(*list(base.children())[:-1])

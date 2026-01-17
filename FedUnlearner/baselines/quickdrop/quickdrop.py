@@ -23,9 +23,9 @@ def _build_model(args, num_classes: int) -> nn.Module:
             return AllCNN(num_classes=num_classes)
     elif args.model == 'resnet18':
         if args.dataset == 'mnist':
-            return ResNet18(num_classes=num_classes, pretrained=args.pretrained, num_channels=1)
+            return ResNet18(num_classes=num_classes, pretrained=args.pretrained, num_channels=1, dataset=args.dataset)
         else:
-            return ResNet18(num_classes=num_classes, pretrained=args.pretrained)
+            return ResNet18(num_classes=num_classes, pretrained=args.pretrained, dataset=args.dataset)
     elif args.model == 'smallcnn':
         in_ch = 1 if args.dataset == 'mnist' else 3
         return SmallCNN(num_channels=in_ch, num_classes=num_classes)

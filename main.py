@@ -558,7 +558,7 @@ parser.add_argument('--baselines', type=str, nargs="*", default=[],
     help='baseline methods for unlearning')
 
 # ===== PGA 超参（显式控制遗忘强度） =====
-parser.add_argument('--pga_alpha', type=float, default=1.95,
+parser.add_argument('--pga_alpha', type=float, default=1.5,
     help='核心：PGA: unlearning strength factor (scales both distance threshold and gradient-ascent step size)')
 parser.add_argument('--pga_unlearn_rounds', type=int, default=5,
     help='PGA: number of gradient-ascent epochs on the forget client data')
@@ -585,8 +585,8 @@ parser.add_argument('--fast_expected_saving', type=int, default=5,
     help='fast-fU: expected number of saved client updates (m)')
 parser.add_argument('--fast_alpha', type=float, default=0.5,
     help='核心：fast-fU: alpha coefficient')
-parser.add_argument('--fast_theta', type=float, default=0.35,
-    help='fast-fU: theta scaling for unlearning term')
+parser.add_argument('--fast_theta', type=float, default=4,
+    help='优先核心：fast-fU: theta scaling for unlearning term')
 
 # ---------- QuickDrop 超参（贴近原实现命名/语义） ----------
 parser.add_argument('--qd_scale', type=float, default=0.01,
@@ -705,7 +705,7 @@ parser.add_argument('--dampening_constant', type=float,
 parser.add_argument('--dampening_upper_bound', type=float,
                     default=0.5, help='dampening upper bound')
 parser.add_argument('--ratio_cutoff', type=float,
-                    default=0.5, help='ratio cutoff,conda核心')
+                    default=0.75, help='ratio cutoff,conda核心')
 # —— CONDA 额外安全阈值
 parser.add_argument('--conda_lower_bound', type=float, default=0,
                     help='CONDA: 乘子下界（避免把权重乘成接近 0）')
@@ -920,9 +920,9 @@ if __name__ == "__main__":
                 return AllCNN(num_classes=num_classes)
         elif args.model == 'resnet18':
             if args.dataset == 'mnist':
-                return ResNet18(num_classes=num_classes, pretrained=args.pretrained, num_channels=1)
+                return ResNet18(num_classes=num_classes, pretrained=args.pretrained, num_channels=1, dataset=args.dataset)
             else:
-                return ResNet18(num_classes=num_classes, pretrained=args.pretrained)
+                return ResNet18(num_classes=num_classes, pretrained=args.pretrained, dataset=args.dataset)
         elif args.model == 'smallcnn':
             in_ch = 1 if args.dataset == 'mnist' else 3
             return SmallCNN(num_channels=in_ch, num_classes=num_classes)
@@ -995,10 +995,10 @@ if __name__ == "__main__":
     elif args.model == 'resnet18':
         if args.dataset == 'mnist':
             global_model = ResNet18(num_classes=num_classes,
-                                    pretrained=args.pretrained, num_channels=1)
+                                    pretrained=args.pretrained, num_channels=1, dataset=args.dataset)
         else:
             global_model = ResNet18(num_classes=num_classes,
-                                    pretrained=args.pretrained)
+                                    pretrained=args.pretrained, dataset=args.dataset)
 
     elif args.model == 'smallcnn':
         in_ch = 1 if args.dataset == 'mnist' else 3

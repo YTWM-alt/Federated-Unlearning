@@ -24,10 +24,10 @@ def get_model(model: str,
     elif model == 'resnet18':
         if dataset == 'mnist':
             new_model = ResNet18(num_classes=num_classes,
-                                 pretrained=pretrained, num_channels=1)
+                                 pretrained=pretrained, num_channels=1, dataset=dataset)
         else:
             new_model = ResNet18(num_classes=num_classes,
-                                 pretrained=pretrained)
+                                 pretrained=pretrained, dataset=dataset)
     else:
         raise "Invalid model name"
     new_model = new_model.to(device)

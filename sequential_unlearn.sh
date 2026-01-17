@@ -5,24 +5,24 @@
 # ============================================
 
 # 固定参数
-DATASET="cifar10"
+DATASET="cifar100"
 MODEL="resnet18"
 OPTIMIZER="sgd"
 TOTAL_CLIENTS=20
-ITERS=1
+ITERS=200
 DEVICE="cuda"
 LR=0.01
 EPOCHS=1
 SEED=42
-FULL_TRAIN_DIR="./experiments/cifar10_resnet18_exclusive/full_training"
-DISTRIBUTION="exclusive"
-BASE_EXP_NAME="cifar10_resnet18_exclusive"
+FULL_TRAIN_DIR="./experiments/cifar100_resnet18_alpha0.5/full_training"
+DISTRIBUTION="dirichlet"
+BASE_EXP_NAME="cifar100_resnet18_alpha0.5"
 
 # 超参数取值范围
-FAIR_RANK_LIST=(106)
-FAIR_TAU_MODES=("median")
+FAIR_RANK_LIST=(96)
+FAIR_TAU_MODES=("mean")
 FAIR_FISHER_BATCHES=(10)
-FAIR_ERASE_SCALES=(0.265)
+FAIR_ERASE_SCALES=(0.15)
 FORGET_CLIENTS=(0)
 
 # 循环执行实验
@@ -55,7 +55,7 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --num_participating_clients -1 \
             --seed $SEED \
             --num_local_epochs $EPOCHS \
-            --baselines fair_vue\
+            --baselines fed_eraser\
             --fair_rank_k $RANK_K \
             --fair_tau_mode $TAU_MODE \
             --fair_fisher_batches $FISHER_B \
@@ -63,9 +63,9 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --fair_repair_ratio 0.2\
             --fair_ablation none \
             --fair_vue_debug false \
-            --skip_training true \
-            --skip_retraining true \
-            --execution_stage unlearning \
+            --skip_training false \
+            --skip_retraining false \
+            --execution_stage all \
             --full_training_dir $FULL_TRAIN_DIR \
             --retraining_dir $RETRAIN_MODEL_PATH \
             --apply_membership_inference true \
@@ -73,14 +73,14 @@ for CID in "${FORGET_CLIENTS[@]}"; do
             --fair_auto_tune_all false \
             --fair_auto_erase false \
             --fe_max_step_ratio 0.1 \
-            --ratio_cutoff 0.17 \
+            --ratio_cutoff 0.4 \
             --dampening_constant 0.2 \
             --dampening_upper_bound 0.2 \
             --conda_eps 1e-6 \
-            --conda_weights_path ./experiments/cifar10_resnet18_exclusive/full_training \
+            --conda_weights_path ./experiments/cifar100_resnet18_alpha0.5/full_training \
             --pga_unlearn_lr 4 \
-            --qd_unlearn_lr 0.07375 \
-            --qd_unlearn_wd 0.02 \
+            --qd_unlearn_lr 0.1 \
+            --qd_unlearn_wd 0.1 \
 
           echo "✅ 完成：client=${CID}, k=${RANK_K}, tau=${TAU_MODE}, fb=${FISHER_B}, es=${ERASE_S}"
           echo
