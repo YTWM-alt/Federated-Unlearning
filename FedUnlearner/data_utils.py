@@ -58,19 +58,24 @@ def get_dataset(dataset_name: str) -> Tuple[torch.utils.data.Dataset, torch.util
 
     elif dataset_name == 'cifar100':
         data_dir = './data/cifar100/'
-        mean = (0.4914, 0.4822, 0.4465)
-        std  = (0.2023, 0.1994, 0.2010)
+        # [修改] 迁移学习建议使用 ImageNet 的均值和方差，而不是 CIFAR 自己的
+        mean = (0.485, 0.456, 0.406)
+        std  = (0.229, 0.224, 0.225)
+        
         # 训练增强：标准 CIFAR 套餐
         train_transform = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
+            # [修改] 配合预训练模型：放大到 224x224 (ResNet 标准输入)
+            # [修改] 224太慢了，改成 112 或者 96，既能利用预训练，速度也能快4-5倍
+            transforms.Resize((96, 96)), 
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
-            transforms.RandomErasing(p=0.25)
+            #transforms.RandomErasing(p=0.25)
         ])
         # 测试/评估：只做归一化
         test_transform = transforms.Compose([
-            transforms.Resize(size=(32, 32)),
+            # [修改] 测试集也要放大
+            transforms.Resize((96, 96)),
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
         ])

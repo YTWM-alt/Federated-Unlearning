@@ -158,17 +158,21 @@ class ResNet18(nn.Module):
         # 2. [动态修复] 根据数据集调整 Conv1 结构
         # TinyImageNet(64x64) 的 checkpoint 使用的是标准 7x7 卷积 ([64, 3, 7, 7])
         # CIFAR(32x32) / MNIST(28x28) 使用的是修改版 3x3 卷积 ([64, c, 3, 3])
-        if dataset in ['cifar10', 'cifar100', 'mnist']:
+        # [修改] 如果开启预训练(pretrained=True)，CIFAR也应该保留原生结构(7x7)以匹配权重
+        # 只有 MNIST(通道不对) 或者 不使用预训练的CIFAR(为了适应小图) 才替换 conv1
+        if dataset == 'mnist' or (not pretrained and dataset in ['cifar10', 'cifar100']):
             base.conv1 = nn.Conv2d(num_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
             base.maxpool = nn.Identity()
         else:
             # TinyImageNet 或其他：保持标准 ResNet 结构 (7x7, stride=2)
+            # 或者是开启了预训练的 CIFAR (此时我们将在 data_utils 里把图片放大)
             # 如果通道数不是3 (虽然TinyImageNet是3)，需重置第一层以匹配通道
             if num_channels != 3:
                 base.conv1 = nn.Conv2d(num_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
 
         # 3. 截取全连接层前的部分
         self.base = nn.Sequential(*list(base.children())[:-1])
+
         
         # 4. 修改全连接层
         in_features = base.fc.in_features
