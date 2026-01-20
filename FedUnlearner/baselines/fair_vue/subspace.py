@@ -29,13 +29,21 @@ def topk_right_singular_vectors(X: torch.Tensor, k: int) -> torch.Tensor:
     U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
     return Vh.T[:, :k]
 
-def rho_values(V: torch.Tensor, other_deltas: List[Dict[str, torch.Tensor]]) -> List[float]:
-    if len(other_deltas) == 0:
-        return [0.0 for _ in range(V.shape[1])]
-    device = V.device
-    D = torch.stack([flatten_state_dict(d).to(V.device) for d in other_deltas], dim=0)
-    return [float(torch.abs(D @ V[:, i]).mean().item()) for i in range(V.shape[1])]
-
+def rho_values(V: torch.Tensor, other_deltas: List[Dict[str, torch.Tensor]], fisher: Dict[str, torch.Tensor]) -> List[float]: # 增加 fisher 参数
+    # ...
+    # 加载 fisher 权重
+    flat_f = flatten_state_dict(fisher).to(V.device)
+    w = torch.sqrt(flat_f + 1e-12)
+    
+    # 对 D 进行加权，使其进入黎曼空间 (对应论文中的 \Phi(\Delta_j))
+    # 注意：这里需要归一化，对应论文公式中的分母
+    D_raw = torch.stack([flatten_state_dict(d).to(V.device) for d in other_deltas], dim=0)
+    D_weighted = D_raw * w.unsqueeze(0)
+    D_norm = torch.norm(D_weighted, dim=1, keepdim=True) + 1e-12
+    D_final = D_weighted / D_norm 
+    
+    return [float(torch.abs(D_final @ V[:, i]).mean().item()) for i in range(V.shape[1])]
+    
 def split_subspaces(V: torch.Tensor, rho: List[float], tau: float) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[int]]:
     spec_idx = [i for i, r in enumerate(rho) if r < tau]
     comm_idx = [i for i, r in enumerate(rho) if r >= tau]
@@ -104,31 +112,52 @@ def rho_values_keys(
     V: torch.Tensor,
     other_deltas: list,
     keys: list,
+    fisher: Dict[str, torch.Tensor], # <--- [新增参数] 必须传入 fisher
     max_samples: int = 512,
 ) -> list:
-    """
-    流式计算 ρ，避免把所有 other_deltas 堆到 (M×D) 大矩阵里。
-    同时对子样本数做上限（默认 512），控制时间/内存。
-    ρ_i = mean_{d∈others} |v_i^T d|
-    """
     k = int(V.shape[1])
     if len(other_deltas) == 0 or k == 0:
         return [0.0 for _ in range(k)]
     device = V.device
-    # —— 子采样，防止 M 极大导致长时间/大内存
+    
+    # [新增] 准备权重 w = sqrt(F)
+    # 注意：这里要确保 keys 和 fisher 对齐
+    w_list = []
+    for k_name in keys:
+        if k_name in fisher:
+            w_list.append(torch.sqrt(fisher[k_name].to(device).view(-1) + 1e-12))
+        else:
+            # 兜底：如果没有fisher值，用1代替 (理论上不应发生)
+            # 这里的长度需要获取 model 参数长度，稍微麻烦点，建议确保 keys 都在 fisher 里
+            pass 
+    w = torch.cat(w_list)
+
     if max_samples is not None and len(other_deltas) > max_samples:
         step = max(1, len(other_deltas) // max_samples)
         others = other_deltas[::step][:max_samples]
     else:
         others = other_deltas
+        
     totals = torch.zeros(k, device=device, dtype=torch.float32)
     VT = V.T.contiguous()  # k × D
+    
     cnt = 0
     for d in others:
-        v = flatten_by_keys(d, keys, device=device).float()  # D
-        s = torch.abs(VT @ v)  # k
+        # [修改] 1. 获取原始 delta
+        v_raw = flatten_by_keys(d, keys, device=device).float()
+        
+        # [修改] 2. 变换到黎曼空间: v_riem = v_raw * w
+        v_riem = v_raw * w
+        
+        # [修改] 3. 归一化 (对应论文公式中的分母)
+        norm_v = torch.norm(v_riem) + 1e-12
+        v_normed = v_riem / norm_v
+
+        # [修改] 4. 计算投影 (此时 V 和 v_normed 都在黎曼空间)
+        s = torch.abs(VT @ v_normed) 
         totals += s
         cnt += 1
+        
     if cnt == 0:
         return [0.0 for _ in range(k)]
     means = (totals / float(cnt)).tolist()

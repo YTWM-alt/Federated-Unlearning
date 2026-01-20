@@ -2,7 +2,6 @@ import torch, os, glob
 from typing import List, Dict
 from .fisher import empirical_fisher_diagonal
 from .subspace import weighted_matrix_from_deltas, topk_right_singular_vectors, rho_values, split_subspaces, flatten_state_dict, state_dict_like
-from .projection import projection_matrix, apply_projection_to_update
 
 def load_state_dict(path: str) -> Dict[str, torch.Tensor]:
     ckpt = torch.load(path, map_location="cpu")
@@ -77,10 +76,45 @@ def fair_vue_unlearn(global_model: torch.nn.Module,
     rhos = rho_values(V, [client_deltas[i] for i in others])
     tau = sorted(rhos)[len(rhos)//2] if tau_mode == "median" else sum(rhos)/len(rhos)
     V_spec, V_comm, _, _ = split_subspaces(V, rhos, tau)
-    # 投影全局更新
-    flat_updates = torch.stack([flatten_state_dict(d) for d in client_deltas.values()], dim=0).mean(dim=0)
-    global_delta = state_dict_like(flat_updates, start_sd)
-    P = projection_matrix(V_spec)
-    new_delta = apply_projection_to_update(global_delta, P, start_sd)
+    
+# === [Theoretical Fix A2] 严谨的黎曼流形投影: 变换 -> 投影 -> 逆变换 ===
+    # 1. 准备黎曼度量权重
+    flat_f = flatten_state_dict(fisher).to(device)
+    
+    # [修复 1] 增大 epsilon，防止 Fisher 极小值导致的数值爆炸
+    # 经验值：1e-5 到 1e-4 通常比较稳健
+    epsilon = 1e-5 
+    w = torch.sqrt(flat_f + epsilon)
+    
+    # [修复 2] 逆变换权重的计算与截断
+    # 理论上是 1/w，但为了防止 w 极小导致 w_inv 极大，我们需要 clamp
+    w_inv = 1.0 / w
+    
+    # [关键技巧] 限制放大的倍数。如果某参数 Fisher 很小，我们不应将其更新放大 10000 倍
+    # 设定一个上限，比如 max_scale=100.0 或 1000.0
+    w_inv = torch.clamp(w_inv, max=1000.0)
+
+    # 2. 获取原始全局更新
+    flat_updates_raw = torch.stack([flatten_state_dict(d).to(device) for d in client_deltas.values()], dim=0).mean(dim=0)
+
+    # 3. 变换到黎曼流形
+    flat_updates_weighted = flat_updates_raw * w
+
+    # 4. 执行流形上的正交投影
+    if V_spec.numel() > 0:
+        Q, _ = torch.linalg.qr(V_spec, mode='reduced')
+        spec_component = Q @ (Q.T @ flat_updates_weighted)
+        
+        # [可选] 检查一下 spec_component 的范数，如果太大说明可能有问题
+        # print(f"Spec Norm: {torch.norm(spec_component)}")
+        
+        flat_projected_weighted = flat_updates_weighted - spec_component
+    else:
+        flat_projected_weighted = flat_updates_weighted
+
+    # 5. 逆变换回参数空间
+    flat_final = flat_projected_weighted * w_inv
+
+    new_delta = state_dict_like(flat_final, start_sd)
     new_sd = {k: start_sd[k] + new_delta[k] for k in start_sd}
     return new_sd

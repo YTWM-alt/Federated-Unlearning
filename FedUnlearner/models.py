@@ -1,4 +1,5 @@
 import torch.nn as nn
+import torch
 from torchvision.models import resnet18, resnet50
 
 # [新增] 辅助函数：把模型里的 BN 层全换成 GN 层
@@ -16,8 +17,13 @@ def replace_bn_with_gn(module, num_groups=32):
         else:
             replace_bn_with_gn(child, num_groups)
 
+# models.py 中的 SmallCNN 类替换为以下内容
+
 class SmallCNN(nn.Module):
-    """一个很小的卷积网络，适合 MNIST (1×28×28) 和 CIFAR10 (3×32×32)，输入 224 也能跑"""
+    """
+    修改后的 SmallCNN：移除 GAP，改用 Flatten，大幅提升 MNIST/CIFAR 性能。
+    自动适配 MNIST (28x28) 和 CIFAR (32x32)。
+    """
     def __init__(self, num_channels=1, num_classes=10):
         super().__init__()
         self.features = nn.Sequential(
@@ -26,14 +32,31 @@ class SmallCNN(nn.Module):
             nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ReLU(inplace=True),
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1)  # 输出 (B,64,1,1)
+            # [修改] 移除 AdaptiveAvgPool2d(1)，它会破坏浅层网络的空间特征
         )
-        self.classifier = nn.Linear(64, num_classes)
+        
+        # [新增] 动态计算 Linear 层的输入维度
+        self.flat_dim = self._get_flat_dim(num_channels)
+        
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(self.flat_dim, num_classes)
+        )
+
+    def _get_flat_dim(self, num_channels):
+        # 创建一个虚拟输入来推断卷积层输出尺寸
+        # MNIST 是 28x28，CIFAR 是 32x32
+        # 根据通道数简单猜测：1 -> MNIST, 3 -> CIFAR
+        size = 28 if num_channels == 1 else 32
+        with torch.no_grad():
+            dummy = torch.zeros(1, num_channels, size, size)
+            out = self.features(dummy)
+        return out.view(1, -1).size(1)
 
     def forward(self, x):
         x = self.features(x)
-        x = x.view(x.size(0), -1)  # 展平为 (B,64)
-        return self.classifier(x)
+        x = self.classifier(x)
+        return x
 
 
 # Added required classes

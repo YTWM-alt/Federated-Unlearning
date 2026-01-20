@@ -558,7 +558,7 @@ parser.add_argument('--baselines', type=str, nargs="*", default=[],
     help='baseline methods for unlearning')
 
 # ===== PGA 超参（显式控制遗忘强度） =====
-parser.add_argument('--pga_alpha', type=float, default=1.5,
+parser.add_argument('--pga_alpha', type=float, default=18000,
     help='核心：PGA: unlearning strength factor (scales both distance threshold and gradient-ascent step size)')
 parser.add_argument('--pga_unlearn_rounds', type=int, default=5,
     help='PGA: number of gradient-ascent epochs on the forget client data')
@@ -583,9 +583,9 @@ parser.add_argument('--fe_eps', type=float, default=1e-12,
 # ---------- fast-fU 超参（与原实现同名语义） ----------
 parser.add_argument('--fast_expected_saving', type=int, default=5,
     help='fast-fU: expected number of saved client updates (m)')
-parser.add_argument('--fast_alpha', type=float, default=0.5,
+parser.add_argument('--fast_alpha', type=float, default=1,
     help='核心：fast-fU: alpha coefficient')
-parser.add_argument('--fast_theta', type=float, default=4,
+parser.add_argument('--fast_theta', type=float, default=68.75,
     help='优先核心：fast-fU: theta scaling for unlearning term')
 
 # ---------- QuickDrop 超参（贴近原实现命名/语义） ----------
@@ -1557,6 +1557,13 @@ if __name__ == "__main__":
                     device=args.device,
                     eval_nonmem_loader=mia_eval_nonmem_loader
                 )
+
+
+            # [Save] 保存 PGA 模型供后续可视化
+            save_p = os.path.join(weights_path, "pga_model.pth")
+            torch.save(unlearned_pga_model.state_dict(), save_p)
+            print(f"[PGA] Model saved to: {save_p}")
+
             print_forgetting_metrics("PGA", test_acc_pga, retain_acc_pga, target_acc_pga, target_loss_pga, speedup_pga, angle_pga, mia_pga)
             _pm_pga.__exit__(None, None, None)
             _print_mem_overhead("PGA", _pm_pga, summary)
@@ -1956,7 +1963,7 @@ if __name__ == "__main__":
             dev = V.device  # 统一使用这个设备
 
             # 5) 计算ρ并按阈值切分为 V_spec / V_comm
-            rhos = rho_values_keys(V, other_deltas_list, keys_valid, max_samples=int(args.fair_rho_max_samples))  # 内部已用 V.device 对齐
+            rhos = rho_values_keys(V, other_deltas_list, keys_valid, fisher=fisher, max_samples=int(args.fair_rho_max_samples))  # 内部已用 V.device 对齐
             if len(rhos) == 0:
                 tau = float('inf')
             else:
@@ -2245,6 +2252,13 @@ if __name__ == "__main__":
                     eval_nonmem_loader=mia_eval_nonmem_loader
                     
                 )
+            
+                # [Save] 保存 FAIR-VUE 模型供后续可视化
+                # 注意：如果启用了 heal，这里保存的是 heal 之后的最终模型
+                save_f = os.path.join(weights_path, "fair_vue_model.pth")
+                torch.save(fair_model.state_dict(), save_f)
+                print(f"[FAIR-VUE] Model saved to: {save_f}")
+
                 if args.mia_verbose:
                     print(f"[调试] MIA 返回类型: {type(mia_fair)}")
                     if isinstance(mia_fair, dict):
