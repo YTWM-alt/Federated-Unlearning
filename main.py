@@ -659,6 +659,8 @@ parser.add_argument('--fair_rho_max_samples', type=int, default=128,
                     help='ρ 的其它客户端子采样上限（默认 128）')
 parser.add_argument('--fair_use_delta_cache', type=str2bool, default=True,
                     help='FAIR-VUE: 是否启用逐轮增量缓存（默认开启）')
+parser.add_argument('--fair_fisher_type', type=str, default='diagonal', choices=['diagonal', 'full'],
+                    help='Fisher 矩阵类型：diagonal(对角近似,默认), full(全量矩阵,仅限小模型!)')
 
 # ==== FAIR-VUE 消融实验参数 ====
 parser.add_argument('--fair_ablation', type=str, default='none',
@@ -939,7 +941,7 @@ if __name__ == "__main__":
             self.loader = dataloader
             self.args = args
 
-        def compute_fisher(self, model_state_dict, device="cpu", max_batches=10):
+        def compute_fisher(self, model_state_dict, param_keys=None, device="cpu", max_batches=10, fisher_type='diagonal'):
             # 客户端本地重建同构模型并载入服务端下发的参数
             model = _build_fresh_model_for_args(self.args)
             # 若服务端权重来自 DataParallel，自动去除 'module.' 前缀以与本地裸模型对齐
@@ -967,13 +969,23 @@ if __name__ == "__main__":
                 generator=g_fisher
             )
 
-            # 用原始算法计算经验 Fisher 对角近似（保持算法不变）
-            return empirical_fisher_diagonal(
-                model=model,
-                dataloader=temp_loader, # 使用临时 loader，而非 self.loader
-                device=device,
-                max_batches=max_batches
-            )
+            if fisher_type == 'full':
+                from FedUnlearner.baselines.fair_vue.fisher import empirical_fisher_full
+                return empirical_fisher_full(
+                    model=model,
+                    dataloader=temp_loader,
+                    param_keys=param_keys, # 必须传入 key 列表以对齐维度
+                    device=device,
+                    max_batches=max_batches
+                )
+            else:
+                # 用原始算法计算经验 Fisher 对角近似
+                return empirical_fisher_diagonal(
+                    model=model,
+                    dataloader=temp_loader, # 使用临时 loader，而非 self.loader
+                    device=device,
+                    max_batches=max_batches
+                )
 
     # 为每个客户端建立一个端点（仅保存回调，不暴露原始数据给服务端使用）
     client_endpoints = {
@@ -1820,8 +1832,9 @@ if __name__ == "__main__":
                 chosen_fisher = None
                 for b in fisher_grid:
                     b2 = next((c for c in fisher_grid if c >= 2*b), fisher_grid[-1])
-                    Fi_b  = client_endpoints[target_id].compute_fisher(fair_model.state_dict(), device=args.device, max_batches=b)
-                    Fi_b2 = client_endpoints[target_id].compute_fisher(fair_model.state_dict(), device=args.device, max_batches=b2)
+                    # [Auto-Tune] 自动调参阶段强制使用 diagonal 以加速，避免 full fisher 卡死
+                    Fi_b  = client_endpoints[target_id].compute_fisher(fair_model.state_dict(), param_keys=param_keys, device=args.device, max_batches=b, fisher_type='diagonal')
+                    Fi_b2 = client_endpoints[target_id].compute_fisher(fair_model.state_dict(), param_keys=param_keys, device=args.device, max_batches=b2, fisher_type='diagonal')
                     sim = _cos(_flatten_fi(Fi_b), _flatten_fi(Fi_b2))
                     if args.fair_vue_debug:
                         print(f"[FV-AUTO][Fisher] b={b} vs b'={b2} → cos={sim:.4f}")
@@ -1830,7 +1843,7 @@ if __name__ == "__main__":
                         chosen_fisher = Fi_b2
                         break
                 if chosen_fisher is None:
-                    chosen_fisher = client_endpoints[target_id].compute_fisher(fair_model.state_dict(), device=args.device, max_batches=chosen_b)
+                    chosen_fisher = client_endpoints[target_id].compute_fisher(fair_model.state_dict(), param_keys=param_keys, device=args.device, max_batches=chosen_b, fisher_type='diagonal')
                 args.fair_fisher_batches = int(chosen_b)
                 if args.fair_vue_debug:
                     print(f"[FV-AUTO][Fisher] chosen_b={args.fair_fisher_batches}")
@@ -1883,8 +1896,10 @@ if __name__ == "__main__":
             if target_id in client_endpoints:
                 fisher = client_endpoints[target_id].compute_fisher(
                     model_state_dict=fair_model.state_dict(),
+                    param_keys=param_keys,  # 传入选定的参数键，确保 Full Fisher 维度匹配
                     device="cpu",
-                    max_batches=args.fair_fisher_batches
+                    max_batches=args.fair_fisher_batches,
+                    fisher_type=args.fair_fisher_type
                 )
             else:
                 # fallback：没有端点时，仅对可训练参数使用单位权重
@@ -1895,32 +1910,58 @@ if __name__ == "__main__":
             if args.fair_ablation == 'no_fisher':
                 if args.fair_vue_debug:
                     print("[FV-ABLATION] Mode: w/o Fisher -> Overwriting Fisher with Identity (Ones).")
-                for k in fisher:
-                    fisher[k] = torch.ones_like(fisher[k])
+                if args.fair_fisher_type == 'full':
+                    # 如果是 Full 模式下 ablation，生成单位矩阵
+                    # 注意：这可能会 OOM，但逻辑上是正确的
+                    dim = fisher.shape[0]
+                    fisher = torch.eye(dim)
+                else:
+                    for k in fisher:
+                        fisher[k] = torch.ones_like(fisher[k])
 
 
             # === Fisher 计算完毕后，插入点 B ===
             if args.fair_vue_debug:
                 import torch
                 from FedUnlearner.baselines.fair_vue.subspace import flatten_state_dict
-                fvec = flatten_state_dict(fisher)
-                print(f"[FV-DBG] fisher: device={fvec.device}, D={fvec.numel()}, "
-                    f"min={float(torch.min(fvec)): .3e}, max={float(torch.max(fvec)): .3e}, "
-                    f"mean={float(torch.mean(fvec)): .3e}")
+                if isinstance(fisher, torch.Tensor):
+                    # Full matrix
+                    print(f"[FV-DBG] Full Fisher Matrix: shape={fisher.shape}, "
+                          f"trace={fisher.trace().item():.3e}, mean={fisher.mean().item():.3e}")
+                else:
+                    fvec = flatten_state_dict(fisher)
+                    print(f"[FV-DBG] fisher: device={fvec.device}, D={fvec.numel()}, "
+                        f"min={float(torch.min(fvec)): .3e}, max={float(torch.max(fvec)): .3e}, "
+                        f"mean={float(torch.mean(fvec)): .3e}")
 
             if args.fair_vue_debug:
                 _fv_last_t = _fv_time_mark("step3_fisher", _t0, _fv_last_t)
 
             # 4) Fisher加权矩阵 & 低秩SVD拿到主方向V
             #    与 Fisher / deltas 对齐 keys，避免空拼接或维度不一致
-            fisher_keys = set(fisher.keys())
-            keys_valid = [k for k in param_keys
-                          if (k in fisher_keys)
-                          and all(k in d for d in target_deltas_list)
-                          and (len(other_deltas_list) == 0 or all(k in d for d in other_deltas_list))]
+            #    与 Fisher / deltas 对齐 keys，避免空拼接或维度不一致
+            
+            if args.fair_fisher_type == 'full':
+                # Full 模式：Fisher 是矩阵，没有 keys。
+                # 假设 param_keys 已经在 compute_fisher 时对齐，这里只检查 deltas 是否包含这些 key
+                keys_valid = [k for k in param_keys
+                              if all(k in d for d in target_deltas_list)
+                              and (len(other_deltas_list) == 0 or all(k in d for d in other_deltas_list))]
+            else:
+                # Diagonal 模式：Fisher 是字典，需要求交集
+                fisher_keys = set(fisher.keys())
+                keys_valid = [k for k in param_keys
+                              if (k in fisher_keys)
+                              and all(k in d for d in target_deltas_list)
+                              and (len(other_deltas_list) == 0 or all(k in d for d in other_deltas_list))]
             if len(keys_valid) == 0:
                 # 放宽：只强制覆盖 target_deltas
-                keys_valid = [k for k in param_keys if (k in fisher_keys) and all(k in d for d in target_deltas_list)]
+                if args.fair_fisher_type == 'full':
+                    # Full 模式下 fisher 是 Tensor 没有 keys，假设 param_keys 已经对齐
+                    keys_valid = [k for k in param_keys if all(k in d for d in target_deltas_list)]
+                else:
+                    keys_valid = [k for k in param_keys if (k in fisher_keys) and all(k in d for d in target_deltas_list)]
+
             if len(keys_valid) == 0:
                 raise RuntimeError(
                     f"[FAIR-VUE] 参与子空间的参数键为空。示例 param_keys={param_keys[:6]}，"

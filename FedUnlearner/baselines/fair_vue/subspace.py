@@ -1,5 +1,5 @@
 import torch
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Union
 
 def flatten_state_dict(sd: Dict[str, torch.Tensor]) -> torch.Tensor:
     return torch.cat([v.view(-1) for v in sd.values()])
@@ -71,20 +71,43 @@ def state_dict_like_by_keys(vec: torch.Tensor, ref: Dict[str, torch.Tensor], key
         offset += n
     return out
 
-def weighted_matrix_from_deltas_keys(deltas: list, fisher: Dict[str, torch.Tensor], keys: list, device: str = "cpu") -> torch.Tensor:
+def weighted_matrix_from_deltas_keys(deltas: list, fisher: Union[Dict[str, torch.Tensor], torch.Tensor], keys: list, device: str = "cpu") -> torch.Tensor:
     # 对齐与防御：keys 不能为空，且必须同时存在于 fisher 与每个 delta 中
     if not keys:
         raise RuntimeError("weighted_matrix_from_deltas_keys: received empty keys after filtering.")
-    valid_keys = [k for k in keys if (k in fisher) and all(k in d for d in deltas)]
-    if len(valid_keys) == 0:
-        sample = list(fisher.keys())[:8]
-        raise RuntimeError(
-            f"weighted_matrix_from_deltas_keys: no overlapping keys among requested={keys[:6]} and fisher/deltas. "
-            f"fisher_sample={sample}"
-        )
-    w = torch.sqrt(torch.cat([fisher[k].to(device).view(-1) for k in valid_keys]) + 1e-12)
-    X = torch.stack([flatten_by_keys(d, valid_keys, device=device) for d in deltas], dim=0)
-    return X * w.unsqueeze(0)
+    
+    # 分支 1：Full Fisher (Tensor)
+    if isinstance(fisher, torch.Tensor):
+        # 此时 fisher 是 D x D 矩阵
+        # X 是 T x D 矩阵
+        # 我们需要计算 X_new = X @ (F^0.5)
+        # F 是对称正半定，做 Cholesky: F = L @ L.T, 则 F^0.5 对应 L.T
+        # 黎曼度量: ||v||_F^2 = v.T @ F @ v = v.T @ L @ L.T @ v = || L.T @ v ||_2^2
+        # 所以我们需要把 delta 变换为 L.T @ delta
+        
+        valid_keys = [k for k in keys if all(k in d for d in deltas)] # Full模式下假定fisher维度已对齐
+        X = torch.stack([flatten_by_keys(d, valid_keys, device=device) for d in deltas], dim=0) # T x D
+        
+        fisher = fisher.to(device)
+        # 添加微小扰动保证 Cholesky 稳定性
+        epsilon = 1e-6
+        L = torch.linalg.cholesky(fisher + epsilon * torch.eye(fisher.shape[0], device=device))
+        # 变换： X_weighted = X @ L (这样每一行 d 变成了 d @ L -> (L.T @ d.T).T )
+        # 验证： ||d||_F^2 = d F d^T = d L L^T d^T = (d L) (d L)^T. 
+        return X @ L
+
+    # 分支 2：Diagonal Fisher (Dict)
+    else:
+        valid_keys = [k for k in keys if (k in fisher) and all(k in d for d in deltas)]
+        if len(valid_keys) == 0:
+            sample = list(fisher.keys())[:8]
+            raise RuntimeError(
+                f"weighted_matrix_from_deltas_keys: no overlapping keys among requested={keys[:6]} and fisher/deltas. "
+                f"fisher_sample={sample}"
+            )
+        w = torch.sqrt(torch.cat([fisher[k].to(device).view(-1) for k in valid_keys]) + 1e-12)
+        X = torch.stack([flatten_by_keys(d, valid_keys, device=device) for d in deltas], dim=0)
+        return X * w.unsqueeze(0)
 
 @torch.no_grad()
 def topk_right_singular_vectors_gram(X: torch.Tensor, k: int) -> torch.Tensor:
@@ -112,7 +135,7 @@ def rho_values_keys(
     V: torch.Tensor,
     other_deltas: list,
     keys: list,
-    fisher: Dict[str, torch.Tensor], # <--- [新增参数] 必须传入 fisher
+    fisher: Union[Dict[str, torch.Tensor], torch.Tensor],  # <--- [新增参数] 必须传入 fisher
     max_samples: int = 512,
 ) -> list:
     k = int(V.shape[1])
@@ -120,17 +143,32 @@ def rho_values_keys(
         return [0.0 for _ in range(k)]
     device = V.device
     
-    # [新增] 准备权重 w = sqrt(F)
-    # 注意：这里要确保 keys 和 fisher 对齐
-    w_list = []
-    for k_name in keys:
-        if k_name in fisher:
-            w_list.append(torch.sqrt(fisher[k_name].to(device).view(-1) + 1e-12))
+    # [修改] 准备加权算子 (Full vs Diagonal)
+    L_transform = None
+    w_diag = None
+    
+    if isinstance(fisher, torch.Tensor):
+        # Case 1: Full Fisher Matrix
+        # 预计算 Cholesky 分解 L，用于将 vector 映射到黎曼空间: v_riem = v_raw @ L
+        fisher = fisher.to(device)
+        epsilon = 1e-6
+        L_transform = torch.linalg.cholesky(fisher + epsilon * torch.eye(fisher.shape[0], device=device))
+    else:
+        # Case 2: Diagonal Fisher Dict
+        # 预计算对角权重 w = sqrt(F)
+        w_list = []
+        for k_name in keys:
+            # Diagonal 模式下 fisher 是字典
+            if k_name in fisher:
+                w_list.append(torch.sqrt(fisher[k_name].to(device).view(-1) + 1e-12))
+            else:
+                # 理论上不应发生，若发生需报错或处理
+                pass 
+        if w_list:
+            w_diag = torch.cat(w_list)
         else:
-            # 兜底：如果没有fisher值，用1代替 (理论上不应发生)
-            # 这里的长度需要获取 model 参数长度，稍微麻烦点，建议确保 keys 都在 fisher 里
-            pass 
-    w = torch.cat(w_list)
+            # 极其罕见的空列表保护
+            w_diag = torch.ones(1, device=device) # 仅占位，后续代码可能会 shape mismatch 报错
 
     if max_samples is not None and len(other_deltas) > max_samples:
         step = max(1, len(other_deltas) // max_samples)
@@ -146,8 +184,11 @@ def rho_values_keys(
         # [修改] 1. 获取原始 delta
         v_raw = flatten_by_keys(d, keys, device=device).float()
         
-        # [修改] 2. 变换到黎曼空间: v_riem = v_raw * w
-        v_riem = v_raw * w
+        # [修改] 2. 变换到黎曼空间
+        if L_transform is not None:
+            v_riem = v_raw @ L_transform # Full: 向量-矩阵乘法
+        else:
+            v_riem = v_raw * w_diag      # Diagonal: 逐元素乘法
         
         # [修改] 3. 归一化 (对应论文公式中的分母)
         norm_v = torch.norm(v_riem) + 1e-12
